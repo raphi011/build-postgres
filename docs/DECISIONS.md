@@ -120,3 +120,21 @@ internal/` is the supported way to view a chapter's delta.
 
 The repository is for personal use. Correctness is checked by running the
 test suite on `solution` before tagging.
+
+## D16: One token kind for all keywords, one kind per operator
+
+The lexer returns every keyword as `Kind == Keyword` with the lower-cased
+word in `Text`, and gives each operator and punctuation character its own
+`Kind`. The operator set is closed by the expression grammar and the parser
+switches on it structurally; the keyword list grows with later chapters
+(`INDEX`, `UNIQUE`, `ANALYZE`) and is easier to extend as a table than as
+an enum plus `String()` method. PostgreSQL generates a token per keyword
+from `kwlist.h`; the parser-facing effect is the same.
+
+## D17: Every keyword is reserved
+
+PostgreSQL has four keyword classes so that `key`, `level`, or `name` can
+still be a column name. We have one class and keep the list short instead.
+Type names (`int4`, `text`) are identifiers that the parser recognises,
+which is also how PostgreSQL treats the ones that are not SQL-standard
+words.
