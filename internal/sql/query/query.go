@@ -4,6 +4,10 @@
 package query
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
+
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/tuple"
@@ -163,7 +167,15 @@ const (
 
 // String returns the operator as written in SQL.
 func (o BoolOp) String() string {
-	panic("not implemented")
+	switch o {
+	case And:
+		return "AND"
+	case Or:
+		return "OR"
+	case Not:
+		return "NOT"
+	}
+	return "BoolOp(?)"
 }
 
 // BoolExpr is AND or OR over two or more boolean arguments, or NOT over
@@ -210,24 +222,162 @@ func (*Cast) exprNode()     {}
 // dump format"): two-space indentation, no trailing newline, identifiers
 // through ast.QuoteIdent, absent clauses omitted, nested statements
 // indented by one more level.
-func (s *Select) String() string      { panic("not implemented") }
-func (s *Insert) String() string      { panic("not implemented") }
-func (s *Update) String() string      { panic("not implemented") }
-func (s *Delete) String() string      { panic("not implemented") }
-func (s *CreateTable) String() string { panic("not implemented") }
-func (s *DropTable) String() string   { panic("not implemented") }
-func (*Begin) String() string         { panic("not implemented") }
-func (*Commit) String() string        { panic("not implemented") }
-func (*Rollback) String() string      { panic("not implemented") }
-func (s *Explain) String() string     { panic("not implemented") }
+func (s *Select) String() string {
+	var b strings.Builder
+	b.WriteString("Select")
+	if len(s.Range) > 0 {
+		b.WriteString("\n  From: ")
+		for i, r := range s.Range {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(r.String())
+		}
+	}
+	for _, t := range s.Targets {
+		fmt.Fprintf(&b, "\n  Target: %s %s := %s", t.Name, t.Expr.Type(), t.Expr)
+	}
+	if s.Where != nil {
+		fmt.Fprintf(&b, "\n  Where: %s", s.Where)
+	}
+	if len(s.OrderBy) > 0 {
+		b.WriteString("\n  Order: ")
+		for i, k := range s.OrderBy {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			dir := "ASC"
+			if k.Desc {
+				dir = "DESC"
+			}
+			fmt.Fprintf(&b, "%s %s", k.Expr, dir)
+		}
+	}
+	if s.Limit != nil {
+		fmt.Fprintf(&b, "\n  Limit: %s", s.Limit)
+	}
+	return b.String()
+}
+
+// String renders the entry as name (oid) or name AS alias (oid).
+func (r *RangeEntry) String() string {
+	name := ast.QuoteIdent(r.Rel.Name)
+	if r.Alias != r.Rel.Name {
+		name += " AS " + ast.QuoteIdent(r.Alias)
+	}
+	return fmt.Sprintf("%s (%d)", name, r.Rel.OID)
+}
+
+func (s *Insert) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Insert %s", s.Rel)
+	for _, row := range s.Rows {
+		b.WriteString("\n  Row: ")
+		for i, e := range row {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(e.String())
+		}
+	}
+	return b.String()
+}
+
+func (s *Update) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Update %s", s.Rel)
+	for _, a := range s.Set {
+		fmt.Fprintf(&b, "\n  Set: %s := %s", ast.QuoteIdent(s.Rel.Rel.Desc.Attrs[a.Attr].Name), a.Value)
+	}
+	if s.Where != nil {
+		fmt.Fprintf(&b, "\n  Where: %s", s.Where)
+	}
+	return b.String()
+}
+
+func (s *Delete) String() string {
+	out := "Delete " + s.Rel.String()
+	if s.Where != nil {
+		out += "\n  Where: " + s.Where.String()
+	}
+	return out
+}
+
+func (s *CreateTable) String() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "CreateTable %s (", ast.QuoteIdent(s.Name))
+	for i, a := range s.Desc.Attrs {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s %s", ast.QuoteIdent(a.Name), a.Type)
+		if a.NotNull {
+			b.WriteString(" NOT NULL")
+		}
+		if i == s.PrimaryKey {
+			b.WriteString(" PRIMARY KEY")
+		}
+	}
+	b.WriteString(")")
+	return b.String()
+}
+
+func (s *DropTable) String() string { return "DropTable " + ast.QuoteIdent(s.Name) }
+func (*Begin) String() string       { return "Begin" }
+func (*Commit) String() string      { return "Commit" }
+func (*Rollback) String() string    { return "Rollback" }
+
+func (s *Explain) String() string {
+	return "Explain\n  " + strings.ReplaceAll(s.Stmt.String(), "\n", "\n  ")
+}
 
 // Expressions print as SQL with every operator application in
 // parentheses; constants show their type where the digits alone would
 // not (1::int8, NULL::bool), so the dump doubles as a type check.
-func (e *Var) String() string      { panic("not implemented") }
-func (e *Const) String() string    { panic("not implemented") }
-func (e *OpExpr) String() string   { panic("not implemented") }
-func (e *BoolExpr) String() string { panic("not implemented") }
-func (e *Neg) String() string      { panic("not implemented") }
-func (e *NullTest) String() string { panic("not implemented") }
-func (e *Cast) String() string     { panic("not implemented") }
+func (e *Var) String() string {
+	return ast.QuoteIdent(e.Alias) + "." + ast.QuoteIdent(e.Column)
+}
+
+func (e *Const) String() string {
+	if e.Null {
+		return "NULL::" + e.Typ.String()
+	}
+	switch v := e.Value.(type) {
+	case int32:
+		return strconv.FormatInt(int64(v), 10)
+	case int64:
+		return strconv.FormatInt(v, 10) + "::int8"
+	case bool:
+		if v {
+			return "TRUE"
+		}
+		return "FALSE"
+	case string:
+		return ast.QuoteString(v)
+	}
+	return fmt.Sprintf("Const(%v)", e.Value)
+}
+
+func (e *OpExpr) String() string {
+	return "(" + e.Left.String() + " " + e.Op.String() + " " + e.Right.String() + ")"
+}
+
+func (e *BoolExpr) String() string {
+	if e.Op == Not {
+		return "(NOT " + e.Args[0].String() + ")"
+	}
+	parts := make([]string, len(e.Args))
+	for i, a := range e.Args {
+		parts[i] = a.String()
+	}
+	return "(" + strings.Join(parts, " "+e.Op.String()+" ") + ")"
+}
+
+func (e *Neg) String() string  { return "(-" + e.X.String() + ")" }
+func (e *Cast) String() string { return e.X.String() + "::" + e.Typ.String() }
+func (e *NullTest) String() string {
+	if e.Not {
+		return "(" + e.X.String() + " IS NOT NULL)"
+	}
+	return "(" + e.X.String() + " IS NULL)"
+}

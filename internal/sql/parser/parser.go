@@ -107,13 +107,14 @@ func ParseExpr(src string) (ast.Expr, error) {
 
 // parser holds the lexer and one token of lookahead.
 type parser struct {
+	src   string
 	lex   *lexer.Lexer
 	tok   lexer.Token
 	depth int // expressions currently open, capped at MaxExprDepth
 }
 
 func newParser(src string) (*parser, error) {
-	p := &parser{lex: lexer.New(src)}
+	p := &parser{src: src, lex: lexer.New(src)}
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
@@ -170,16 +171,32 @@ func (p *parser) ident() (string, error) {
 }
 
 func (p *parser) syntaxError(expected string) error {
-	return &Error{Pos: p.tok.Pos, Err: ErrSyntax, Expected: expected, Found: describe(p.tok)}
+	return &Error{Pos: p.tok.Pos, Err: ErrSyntax, Expected: expected, Found: p.describe(p.tok)}
 }
 
-// describe renders a token for an error message.
-func describe(tok lexer.Token) string {
+// describe renders a token for an error message: as written in the
+// source, the way PostgreSQL echoes it.
+func (p *parser) describe(tok lexer.Token) string {
 	switch tok.Kind {
 	case lexer.EOF:
 		return "end of input"
 	case lexer.String:
 		return ast.QuoteString(tok.Text)
+	case lexer.Keyword, lexer.Ident:
+		rest := p.src[tok.Pos.Offset:]
+		if rest[0] != '"' {
+			// Lower-casing is ASCII-only, so the raw text is as long.
+			return `"` + rest[:len(tok.Text)] + `"`
+		}
+		end := 1
+		for {
+			end += strings.IndexByte(rest[end:], '"') + 1
+			if end >= len(rest) || rest[end] != '"' {
+				break
+			}
+			end++
+		}
+		return `"` + rest[:end] + `"`
 	}
 	return `"` + tok.Text + `"`
 }
@@ -267,7 +284,7 @@ func (p *parser) parseColumnDef() (ast.ColumnDef, error) {
 	}
 	typ, ok := typeNames[p.tok.Text]
 	if !ok {
-		return col, &Error{Pos: p.tok.Pos, Err: ErrUnknownType, Expected: "type name", Found: describe(p.tok)}
+		return col, &Error{Pos: p.tok.Pos, Err: ErrUnknownType, Expected: "type name", Found: `"` + p.tok.Text + `"`}
 	}
 	col.Type = typ
 	if err := p.advance(); err != nil {
@@ -318,22 +335,24 @@ func (p *parser) parseInsert() (ast.Stmt, error) {
 	if err := p.expect("into"); err != nil {
 		return nil, err
 	}
-	name, err := p.ident()
+	tok, err := p.expectKind(lexer.Ident)
 	if err != nil {
 		return nil, err
 	}
-	s := &ast.Insert{Table: name}
+	s := &ast.Insert{Loc: tok.Pos, Table: tok.Text}
 	if p.tok.Kind == lexer.LParen {
 		if err := p.advance(); err != nil {
 			return nil, err
 		}
 		s.Columns = []string{}
 		for {
+			pos := p.tok.Pos
 			col, err := p.ident()
 			if err != nil {
 				return nil, err
 			}
 			s.Columns = append(s.Columns, col)
+			s.ColumnLocs = append(s.ColumnLocs, pos)
 			if p.tok.Kind != lexer.Comma {
 				break
 			}
@@ -546,15 +565,16 @@ func (p *parser) parseUpdate() (ast.Stmt, error) {
 	if err := p.expect("update"); err != nil {
 		return nil, err
 	}
-	name, err := p.ident()
+	tok, err := p.expectKind(lexer.Ident)
 	if err != nil {
 		return nil, err
 	}
 	if err := p.expect("set"); err != nil {
 		return nil, err
 	}
-	s := &ast.Update{Table: name}
+	s := &ast.Update{Loc: tok.Pos, Table: tok.Text}
 	for {
+		pos := p.tok.Pos
 		col, err := p.ident()
 		if err != nil {
 			return nil, err
@@ -566,7 +586,7 @@ func (p *parser) parseUpdate() (ast.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		s.Set = append(s.Set, ast.Assignment{Column: col, Value: val})
+		s.Set = append(s.Set, ast.Assignment{Column: col, Value: val, Loc: pos})
 		if p.tok.Kind != lexer.Comma {
 			break
 		}
@@ -585,11 +605,11 @@ func (p *parser) parseDelete() (ast.Stmt, error) {
 	if err := p.expect("from"); err != nil {
 		return nil, err
 	}
-	name, err := p.ident()
+	tok, err := p.expectKind(lexer.Ident)
 	if err != nil {
 		return nil, err
 	}
-	s := &ast.Delete{Table: name}
+	s := &ast.Delete{Loc: tok.Pos, Table: tok.Text}
 	s.Where, err = p.parseWhere()
 	return s, err
 }
