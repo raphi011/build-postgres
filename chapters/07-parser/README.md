@@ -329,8 +329,10 @@ type Error struct {
 `Expected` is upper case for keywords (`BY`, `NULL`), the character for
 punctuation (`)`, `=`), and a lower-case category otherwise: `statement`,
 `expression`, `identifier`, `type name`, `end of statement`,
-`end of expression`, `end of input`. `Found` is the token text in double
-quotes, a string literal in single quotes, or `end of input`. `Pos` is the
+`end of expression`, `end of input`. `Found` is the token as written in
+the source in double quotes (`"SELEC"`, not the lower-cased `"selec"`;
+a quoted identifier keeps its quotes), a string literal in single quotes,
+or `end of input`. `Pos` is the
 position of the offending token, which is what the REPL will underline.
 PostgreSQL says only `syntax error at or near "x"`; naming the expected
 token costs one string per call site and makes the tests precise.
@@ -382,15 +384,15 @@ type TableExpr interface{ Node; tableExpr() }
 type CreateTable struct { Name string; Columns []ColumnDef }
 type ColumnDef struct { Name string; Type tuple.TypeID; NotNull, PrimaryKey bool }
 type DropTable struct { Name string }
-type Insert struct { Table string; Columns []string; Rows [][]Expr }
+type Insert struct { Loc lexer.Pos; Table string; Columns []string; ColumnLocs []lexer.Pos; Rows [][]Expr }
 type Select struct { Items []SelectItem; From []TableExpr; Where Expr; OrderBy []OrderItem; Limit Expr }
 type SelectItem struct { Expr Expr; Alias string }
 type OrderItem struct { Expr Expr; Desc bool }
 type TableRef struct { Loc lexer.Pos; Name, Alias string }
 type Join struct { Left, Right TableExpr; On Expr }
-type Update struct { Table string; Set []Assignment; Where Expr }
-type Assignment struct { Column string; Value Expr }
-type Delete struct { Table string; Where Expr }
+type Update struct { Loc lexer.Pos; Table string; Set []Assignment; Where Expr }
+type Assignment struct { Column string; Value Expr; Loc lexer.Pos }
+type Delete struct { Loc lexer.Pos; Table string; Where Expr }
 type Begin struct{}
 type Commit struct{}
 type Rollback struct{}
@@ -463,7 +465,8 @@ Semantics the tests depend on:
   and the `Where` of `Update` and `Delete` are `nil` when absent.
 - Positions: `ColumnRef.Loc` is the first identifier of a qualified name;
   `BinaryExpr.Loc` and `IsNull.Loc` are the operator; `UnaryExpr.Loc` is
-  the operator; `TableRef.Loc` is the table name.
+  the operator; `TableRef.Loc`, `Insert.Loc`, `Update.Loc`, and
+  `Delete.Loc` are the table name.
 
 ## Implementation notes
 

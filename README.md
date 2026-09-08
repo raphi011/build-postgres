@@ -51,6 +51,6 @@ recovery, aggregates, the PostgreSQL wire protocol so real `psql` connects.
 
 ## Status
 
-Part 1 (chapters 00–05, storage) is written on `main` with a reference
-implementation on `solution`. Part 2 is in progress: chapters 06 (lexer),
-07 (parser), and 08 (catalog) are written; 09 is next.
+Parts 1 and 2 (chapters 00–09: storage, lexer, parser, catalog,
+analyzer) are written on `main` with a reference implementation on
+`solution`. Part 3 (expressions, executor, REPL) is next.
