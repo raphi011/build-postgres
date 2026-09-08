@@ -93,5 +93,12 @@ var controlMu sync.Mutex
 // WriteControl's errors.
 // PostgreSQL: UpdateControlFile under ControlFileLock in xlog.c.
 func UpdateControl(dir string, fn func(*Control)) error {
-	panic("not implemented")
+	controlMu.Lock()
+	defer controlMu.Unlock()
+	c, err := ReadControl(dir)
+	if err != nil {
+		return err
+	}
+	fn(&c)
+	return WriteControl(dir, c)
 }

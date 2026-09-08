@@ -6,9 +6,12 @@ package txn
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sync"
 
+	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
 
@@ -81,19 +84,43 @@ type Transaction struct {
 // file; catalog.ErrControlCorrupt if it is corrupt.
 // PostgreSQL: StartupCLOG in clog.c, the nextXid part of StartupXLOG.
 func Open(dir string) (*Manager, error) {
-	panic("not implemented")
+	ctl, err := catalog.ReadControl(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Join(dir, Dir), 0o755); err != nil {
+		return nil, err
+	}
+	return &Manager{
+		dir:      dir,
+		next:     ctl.NextXID,
+		running:  map[tuple.XID]bool{},
+		segments: map[uint32]*os.File{},
+	}, nil
 }
 
 // Close closes the commit log files and forgets the transactions still in
 // progress: their handles return ErrFinished from then on, and after a
 // reopen they read as aborted.
 func (m *Manager) Close() error {
-	panic("not implemented")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	clear(m.running)
+	var first error
+	for seg, f := range m.segments {
+		if err := f.Close(); err != nil && first == nil {
+			first = err
+		}
+		delete(m.segments, seg)
+	}
+	return first
 }
 
 // NextXID returns the transaction ID the next Begin will hand out.
 func (m *Manager) NextXID() tuple.XID {
-	panic("not implemented")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.next
 }
 
 // Begin starts a transaction with the next transaction ID. The control
@@ -101,7 +128,18 @@ func (m *Manager) NextXID() tuple.XID {
 // returned, so IDs never repeat across restarts.
 // PostgreSQL: GetNewTransactionId in varsup.c, StartTransaction in xact.c.
 func (m *Manager) Begin() (*Transaction, error) {
-	panic("not implemented")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	xid := m.next
+	err := catalog.UpdateControl(m.dir, func(c *catalog.Control) {
+		c.NextXID = xid + 1
+	})
+	if err != nil {
+		return nil, err
+	}
+	m.next = xid + 1
+	m.running[xid] = true
+	return &Transaction{XID: xid, m: m}, nil
 }
 
 // Commit records the transaction as committed and syncs the commit log
@@ -113,7 +151,7 @@ func (m *Manager) Begin() (*Transaction, error) {
 // PostgreSQL: RecordTransactionCommit in xact.c, TransactionIdCommitTree
 // in transam.c.
 func (t *Transaction) Commit() error {
-	panic("not implemented")
+	return t.finish(Committed, true)
 }
 
 // Abort records the transaction as aborted. The log is not synced: a
@@ -122,7 +160,21 @@ func (t *Transaction) Commit() error {
 // PostgreSQL: RecordTransactionAbort in xact.c, TransactionIdAbortTree
 // in transam.c.
 func (t *Transaction) Abort() error {
-	panic("not implemented")
+	return t.finish(Aborted, false)
+}
+
+func (t *Transaction) finish(status Status, sync bool) error {
+	m := t.m
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.running[t.XID] {
+		return ErrFinished
+	}
+	if err := m.set(t.XID, status, sync); err != nil {
+		return err
+	}
+	delete(m.running, t.XID)
+	return nil
 }
 
 // Status reports the state of a transaction. InvalidXID is Aborted and
@@ -133,5 +185,86 @@ func (t *Transaction) Abort() error {
 // PostgreSQL: TransactionLogFetch in transam.c, TransactionIdIsInProgress
 // in procarray.c.
 func (m *Manager) Status(xid tuple.XID) (Status, error) {
-	panic("not implemented")
+	switch xid {
+	case tuple.InvalidXID:
+		return Aborted, nil
+	case tuple.BootstrapXID, tuple.FrozenXID:
+		return Committed, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if xid >= m.next {
+		return 0, ErrFutureXID
+	}
+	if m.running[xid] {
+		return InProgress, nil
+	}
+	b, err := m.get(xid)
+	if err != nil {
+		return 0, err
+	}
+	if b == InProgress {
+		return Aborted, nil
+	}
+	return b, nil
+}
+
+// segment returns the open file of the segment holding xid, opening or
+// creating it on first use. m.mu must be held.
+func (m *Manager) segment(xid tuple.XID) (*os.File, error) {
+	seg := uint32(xid) / XactsPerSegment
+	if f, ok := m.segments[seg]; ok {
+		return f, nil
+	}
+	name := filepath.Join(m.dir, Dir, fmt.Sprintf("%04X", seg))
+	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	m.segments[seg] = f
+	return f, nil
+}
+
+// offset returns the byte of xid within its segment and the shift of its
+// two bits within that byte.
+func offset(xid tuple.XID) (off int64, shift uint) {
+	x := uint32(xid) % XactsPerSegment
+	return int64(x / XactsPerByte), uint(x%XactsPerByte) * BitsPerXact
+}
+
+// get reads the two bits of xid; a byte past the end of the segment file
+// reads as zero. m.mu must be held.
+func (m *Manager) get(xid tuple.XID) (Status, error) {
+	f, err := m.segment(xid)
+	if err != nil {
+		return 0, err
+	}
+	off, shift := offset(xid)
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], off); err != nil && err != io.EOF {
+		return 0, err
+	}
+	return Status(b[0]>>shift) & 3, nil
+}
+
+// set writes the two bits of xid, extending the segment file if needed,
+// and syncs the file when sync is set. m.mu must be held.
+func (m *Manager) set(xid tuple.XID, s Status, sync bool) error {
+	f, err := m.segment(xid)
+	if err != nil {
+		return err
+	}
+	off, shift := offset(xid)
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], off); err != nil && err != io.EOF {
+		return err
+	}
+	b[0] = b[0]&^(3<<shift) | byte(s)<<shift
+	if _, err := f.WriteAt(b[:], off); err != nil {
+		return err
+	}
+	if sync {
+		return f.Sync()
+	}
+	return nil
 }

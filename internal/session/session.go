@@ -20,6 +20,7 @@ import (
 	"github.com/raphi011/build-postgres/internal/planner"
 	"github.com/raphi011/build-postgres/internal/smgr"
 	"github.com/raphi011/build-postgres/internal/sql/analyzer"
+	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/sql/lexer"
 	"github.com/raphi011/build-postgres/internal/sql/parser"
 	"github.com/raphi011/build-postgres/internal/sql/query"
@@ -75,7 +76,12 @@ func Open(dir string) (*Session, error) {
 		store.Close()
 		return nil, err
 	}
-	return &Session{store: store, pool: pool, cat: cat, xid: tuple.FrozenXID}, nil
+	tm, err := txn.Open(dir)
+	if err != nil {
+		store.Close()
+		return nil, err
+	}
+	return &Session{store: store, pool: pool, cat: cat, txn: tm}, nil
 }
 
 // Catalog returns the session's catalog.
@@ -85,7 +91,17 @@ func (s *Session) Catalog() *catalog.Catalog { return s.cat }
 // closes the commit log and the data directory. Returns the first error.
 // PostgreSQL: ShutdownPostgres in postinit.c.
 func (s *Session) Close() error {
-	err := s.pool.FlushAll()
+	var err error
+	if s.tx != nil && !s.failed {
+		err = s.tx.Abort()
+	}
+	s.tx, s.explicit, s.failed = nil, false, false
+	if ferr := s.pool.FlushAll(); err == nil {
+		err = ferr
+	}
+	if terr := s.txn.Close(); err == nil {
+		err = terr
+	}
 	if cerr := s.store.Close(); err == nil {
 		err = cerr
 	}
@@ -101,9 +117,7 @@ func (s *Session) Close() error {
 // transaction, committed when it succeeds and aborted when it fails.
 // BEGIN opens a block; an error inside it aborts the transaction and
 // every later statement but COMMIT and ROLLBACK fails with
-// ErrInFailedTransaction until one of them ends the block. Every commit,
-// implicit or explicit, flushes the cluster first, so a committed
-// statement survives losing the process without a Close.
+// ErrInFailedTransaction until one of them ends the block.
 // PostgreSQL: exec_simple_query in postgres.c.
 func (s *Session) Exec(sql string) ([]*Result, error) {
 	stmts, err := parser.Parse(sql)
@@ -112,11 +126,14 @@ func (s *Session) Exec(sql string) ([]*Result, error) {
 	}
 	var results []*Result
 	for _, stmt := range stmts {
-		q, err := analyzer.Analyze(stmt, s.cat)
-		if err != nil {
-			return results, wrap(err, sql)
+		var r *Result
+		var err error
+		switch stmt.(type) {
+		case *ast.Begin, *ast.Commit, *ast.Rollback:
+			r, err = s.control(stmt)
+		default:
+			r, err = s.statement(stmt)
 		}
-		r, err := s.run(q)
 		if err != nil {
 			return results, wrap(err, sql)
 		}
@@ -125,11 +142,100 @@ func (s *Session) Exec(sql string) ([]*Result, error) {
 	return results, nil
 }
 
+// statement runs one statement other than transaction control inside the
+// current transaction, starting one if none is open.
+// PostgreSQL: start_xact_command and finish_xact_command in postgres.c.
+func (s *Session) statement(stmt ast.Stmt) (*Result, error) {
+	if s.failed {
+		return nil, ErrInFailedTransaction
+	}
+	if s.tx == nil {
+		tx, err := s.txn.Begin()
+		if err != nil {
+			return nil, err
+		}
+		s.tx = tx
+	}
+	q, err := analyzer.Analyze(stmt, s.cat)
+	var r *Result
+	if err == nil {
+		r, err = s.run(q)
+	}
+	if err != nil {
+		// The transaction is aborted at once; an explicit block stays
+		// open, refusing everything until COMMIT or ROLLBACK.
+		if aerr := s.tx.Abort(); aerr != nil {
+			return nil, aerr
+		}
+		if s.explicit {
+			s.failed = true
+		} else {
+			s.tx = nil
+		}
+		return nil, err
+	}
+	if !s.explicit {
+		if err := s.tx.Commit(); err != nil {
+			return nil, err
+		}
+		s.tx = nil
+	}
+	return r, nil
+}
+
+// control runs BEGIN, COMMIT, or ROLLBACK.
+// PostgreSQL: BeginTransactionBlock, EndTransactionBlock, and
+// UserAbortTransactionBlock in xact.c.
+func (s *Session) control(stmt ast.Stmt) (*Result, error) {
+	switch stmt.(type) {
+	case *ast.Begin:
+		if s.failed {
+			return nil, ErrInFailedTransaction
+		}
+		if s.explicit {
+			return &Result{Tag: "BEGIN", Warnings: []string{WarnAlreadyTransaction}}, nil
+		}
+		tx, err := s.txn.Begin()
+		if err != nil {
+			return nil, err
+		}
+		s.tx, s.explicit = tx, true
+		return &Result{Tag: "BEGIN"}, nil
+	case *ast.Commit:
+		if !s.explicit {
+			return &Result{Tag: "COMMIT", Warnings: []string{WarnNoTransaction}}, nil
+		}
+		if s.failed {
+			s.tx, s.explicit, s.failed = nil, false, false
+			return &Result{Tag: "ROLLBACK"}, nil
+		}
+		if err := s.tx.Commit(); err != nil {
+			return nil, err
+		}
+		s.tx, s.explicit = nil, false
+		return &Result{Tag: "COMMIT"}, nil
+	default:
+		if !s.explicit {
+			return &Result{Tag: "ROLLBACK", Warnings: []string{WarnNoTransaction}}, nil
+		}
+		if !s.failed {
+			if err := s.tx.Abort(); err != nil {
+				return nil, err
+			}
+		}
+		s.tx, s.explicit, s.failed = nil, false, false
+		return &Result{Tag: "ROLLBACK"}, nil
+	}
+}
+
+// xid returns the ID of the current transaction.
+func (s *Session) xid() tuple.XID { return s.tx.XID }
+
 // run executes one bound statement.
 func (s *Session) run(q query.Stmt) (*Result, error) {
 	switch q := q.(type) {
 	case *query.CreateTable:
-		oid, err := s.cat.CreateTable(q.Name, q.Desc, s.xid)
+		oid, err := s.cat.CreateTable(q.Name, q.Desc, s.xid())
 		if err != nil {
 			return nil, ddlError(err, q.Name, q.Desc)
 		}
@@ -137,8 +243,8 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 			// The index is part of the same statement: if it cannot be
 			// made, PostgreSQL's rollback removes the table too.
 			pkey := q.Name + "_pkey"
-			if _, err := s.cat.CreateIndex(pkey, oid, q.PrimaryKey, true, true, s.xid); err != nil {
-				if derr := s.cat.DropTable(q.Name, s.xid); derr != nil {
+			if _, err := s.cat.CreateIndex(pkey, oid, q.PrimaryKey, true, true, s.xid()); err != nil {
+				if derr := s.cat.DropTable(q.Name, s.xid()); derr != nil {
 					return nil, derr
 				}
 				return nil, indexError(err, pkey, q.Name)
@@ -146,12 +252,12 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 		}
 		return &Result{Tag: "CREATE TABLE"}, nil
 	case *query.DropTable:
-		if err := s.cat.DropTable(q.Name, s.xid); err != nil {
+		if err := s.cat.DropTable(q.Name, s.xid()); err != nil {
 			return nil, ddlError(err, q.Name, nil)
 		}
 		return &Result{Tag: "DROP TABLE"}, nil
 	case *query.CreateIndex:
-		idx, err := s.cat.CreateIndex(q.Name, q.Rel.OID, q.Attr, q.Unique, false, s.xid)
+		idx, err := s.cat.CreateIndex(q.Name, q.Rel.OID, q.Attr, q.Unique, false, s.xid())
 		if err != nil {
 			return nil, indexError(err, q.Name, q.Rel.Name)
 		}
@@ -161,14 +267,14 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 		}
 		if err != nil {
 			// A failed build leaves nothing behind (D20).
-			if derr := s.cat.DropIndex(q.Name, s.xid); derr != nil {
+			if derr := s.cat.DropIndex(q.Name, s.xid()); derr != nil {
 				return nil, derr
 			}
 			return nil, err
 		}
 		return &Result{Tag: "CREATE INDEX"}, nil
 	case *query.DropIndex:
-		if err := s.cat.DropIndex(q.Name, s.xid); err != nil {
+		if err := s.cat.DropIndex(q.Name, s.xid()); err != nil {
 			var table string
 			if errors.Is(err, catalog.ErrDependentObjects) {
 				idx, lerr := s.cat.LookupIndex(q.Name)
@@ -184,12 +290,6 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 			return nil, indexError(err, q.Name, table)
 		}
 		return &Result{Tag: "DROP INDEX"}, nil
-	case *query.Begin:
-		return &Result{Tag: "BEGIN"}, nil
-	case *query.Commit:
-		return &Result{Tag: "COMMIT"}, nil
-	case *query.Rollback:
-		return &Result{Tag: "ROLLBACK"}, nil
 	case *query.Explain:
 		p, err := planner.Plan(q.Stmt)
 		if err != nil {
@@ -223,7 +323,7 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, n, err := executor.Exec(p, &executor.Env{Pool: s.pool, XID: s.xid})
+	rows, n, err := executor.Exec(p, &executor.Env{Pool: s.pool, XID: s.xid()})
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +375,7 @@ func (s *Session) analyze(rel *catalog.RelationInfo) error {
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	if err := s.cat.UpdateStats(rel.OID, int32(pages), tuples, s.xid); err != nil {
+	if err := s.cat.UpdateStats(rel.OID, int32(pages), tuples, s.xid()); err != nil {
 		return err
 	}
 	for _, idx := range rel.Indexes {
@@ -283,7 +383,7 @@ func (s *Session) analyze(rel *catalog.RelationInfo) error {
 		if err != nil {
 			return err
 		}
-		if err := s.cat.UpdateStats(idx.OID, int32(n), tuples, s.xid); err != nil {
+		if err := s.cat.UpdateStats(idx.OID, int32(n), tuples, s.xid()); err != nil {
 			return err
 		}
 	}
@@ -372,6 +472,8 @@ func wrap(err error, sql string) error {
 		e.Msg = execErr.Msg
 	case errors.As(err, &idxErr):
 		e.Msg = idxErr.Msg
+	case errors.Is(err, ErrInFailedTransaction):
+		e.Msg = "current transaction is aborted, commands ignored until end of transaction block"
 	default:
 		e.Msg = err.Error()
 	}

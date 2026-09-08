@@ -125,19 +125,17 @@ type Catalog struct {
 	attr  *heap.Relation
 	index *heap.Relation
 
-	mu      sync.Mutex
-	control Control
-	cache   map[string]*RelationInfo // relation cache by name
+	mu    sync.Mutex
+	cache map[string]*RelationInfo // relation cache by name
 }
 
-func newCatalog(pool *bufmgr.Pool, ctl Control) *Catalog {
+func newCatalog(pool *bufmgr.Pool) *Catalog {
 	return &Catalog{
-		pool:    pool,
-		class:   heap.Open(pool, ClassOID, ClassDesc),
-		attr:    heap.Open(pool, AttributeOID, AttributeDesc),
-		index:   heap.Open(pool, IndexOID, IndexDesc),
-		control: ctl,
-		cache:   map[string]*RelationInfo{},
+		pool:  pool,
+		class: heap.Open(pool, ClassOID, ClassDesc),
+		attr:  heap.Open(pool, AttributeOID, AttributeDesc),
+		index: heap.Open(pool, IndexOID, IndexDesc),
+		cache: map[string]*RelationInfo{},
 	}
 }
 
@@ -169,7 +167,7 @@ func Bootstrap(pool *bufmgr.Pool) (*Catalog, error) {
 	if _, err := heap.Create(pool, IndexOID, IndexDesc); err != nil {
 		return nil, err
 	}
-	c := newCatalog(pool, ctl)
+	c := newCatalog(pool)
 	catalogs := []struct {
 		oid  tuple.OID
 		name string
@@ -196,11 +194,10 @@ func Bootstrap(pool *bufmgr.Pool) (*Catalog, error) {
 // missing; ErrControlCorrupt if it is damaged.
 // PostgreSQL: RelationCacheInitializePhase2 in relcache.c.
 func Open(pool *bufmgr.Pool) (*Catalog, error) {
-	ctl, err := ReadControl(pool.Store().Path())
-	if err != nil {
+	if _, err := ReadControl(pool.Store().Path()); err != nil {
 		return nil, err
 	}
-	return newCatalog(pool, ctl), nil
+	return newCatalog(pool), nil
 }
 
 // Pool returns the buffer pool the catalog reads through.
@@ -218,13 +215,14 @@ func (c *Catalog) NewOID() (tuple.OID, error) {
 
 // newOID is NewOID with c.mu held.
 func (c *Catalog) newOID() (tuple.OID, error) {
-	oid := c.control.NextOID
-	next := c.control
-	next.NextOID++
-	if err := WriteControl(c.pool.Store().Path(), next); err != nil {
+	var oid tuple.OID
+	err := UpdateControl(c.pool.Store().Path(), func(ctl *Control) {
+		oid = ctl.NextOID
+		ctl.NextOID++
+	})
+	if err != nil {
 		return tuple.InvalidOID, err
 	}
-	c.control = next
 	return oid, nil
 }
 
