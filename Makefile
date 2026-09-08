@@ -4,8 +4,9 @@ GO ?= go
 
 CH01 = ./internal/page/...
 CH02 = $(CH01) ./internal/tuple/... ./cmd/pgdb/...
+CH03 = $(CH02) ./internal/smgr/...
 
-.PHONY: build test vet regress test-ch01 test-ch02
+.PHONY: build test vet regress test-ch01 test-ch02 test-ch03
 
 build:
 	$(GO) build ./...
@@ -24,3 +25,5 @@ test-ch01:
 	$(GO) test -race $(CH01)
 test-ch02:
 	$(GO) test -race $(CH02)
+test-ch03:
+	$(GO) test -race $(CH03)
