@@ -236,10 +236,12 @@ func describe(n Node) (head string, props []string, children []Node) {
 // IndexScan reads the tuples of Rel whose key in Index satisfies Quals,
 // in index order, fetching each from the heap. Every qual is an OpExpr
 // with the indexed column as its left operand, an expression without
-// Vars on the right, and one of = < <= > >= as operator; several quals
-// on the same side tighten each other. No quals reads the whole index.
-// EXPLAIN prints "Index Scan using i on t" and the quals ANDed together
-// as "Index Cond:".
+// Vars of Rel on the right, and one of = < <= > >= as operator; several
+// quals on the same side tighten each other. No quals reads the whole
+// index. A right operand with Vars of other relations makes the scan
+// parameterised (chapter 15): it is the inner side of a NestLoop, which
+// supplies those relations' current row. EXPLAIN prints "Index Scan
+// using i on t" and the quals ANDed together as "Index Cond:".
 type IndexScan struct {
 	Rel   *query.RangeEntry
 	Index *catalog.IndexInfo
@@ -261,4 +263,73 @@ func ExplainCosts(n Node) []string {
 	var lines []string
 	explain(n, 0, &lines, true)
 	return lines
+}
+
+// Chapter 15: joins.
+
+// NestLoop joins every row of Outer with every row of Inner for which
+// Qual is TRUE; a nil Qual passes every pair. Inner is restarted
+// (Rescan) for each outer row with that row as its parameter, so an
+// IndexScan below it may refer to Outer's columns. Output rows are the
+// outer row's columns followed by the inner row's. EXPLAIN prints
+// "Nested Loop" and Qual as "Join Filter:".
+type NestLoop struct {
+	Outer Node
+	Inner Node
+	Qual  query.Expr
+	Est   Estimate
+}
+
+// HashJoin builds a table of Inner's rows hashed on the right operands
+// of HashQuals, probes it with each outer row's left operands, and
+// passes the pairs for which the hash quals and Qual are TRUE. Every
+// hash qual is an OpExpr with = whose left operand refers only to
+// Outer's columns and whose right operand only to Inner's; Inner is a
+// Hash node. Output rows are the outer row's columns followed by the
+// inner row's. EXPLAIN prints "Hash Join", the hash quals ANDed as
+// "Hash Cond:", and Qual as "Join Filter:".
+type HashJoin struct {
+	Outer     Node
+	Inner     Node
+	HashQuals []query.Expr
+	Qual      query.Expr
+	Est       Estimate
+}
+
+// Hash is the inner side of a HashJoin: the node that reads Input into
+// the hash table. It yields no rows of its own.
+type Hash struct {
+	Input Node
+	Est   Estimate
+}
+
+// Materialize stores the rows of Input on the first pass and replays
+// them on every Rescan, so that a NestLoop reads an inner side that
+// does not depend on the outer row only once.
+type Materialize struct {
+	Input Node
+	Est   Estimate
+}
+
+func (n *NestLoop) Range() []*query.RangeEntry    { return joinRange(n.Outer, n.Inner) }
+func (n *HashJoin) Range() []*query.RangeEntry    { return joinRange(n.Outer, n.Inner) }
+func (n *Hash) Range() []*query.RangeEntry        { return n.Input.Range() }
+func (n *Materialize) Range() []*query.RangeEntry { return n.Input.Range() }
+
+func (n *NestLoop) Estimate() Estimate    { return n.Est }
+func (n *HashJoin) Estimate() Estimate    { return n.Est }
+func (n *Hash) Estimate() Estimate        { return n.Est }
+func (n *Materialize) Estimate() Estimate { return n.Est }
+
+func (*NestLoop) node()    {}
+func (*HashJoin) node()    {}
+func (*Hash) node()        {}
+func (*Materialize) node() {}
+
+// joinRange is the outer range followed by the inner one, in a fresh
+// slice.
+func joinRange(outer, inner Node) []*query.RangeEntry {
+	o := outer.Range()
+	r := make([]*query.RangeEntry, 0, len(o)+len(inner.Range()))
+	return append(append(r, o...), inner.Range()...)
 }

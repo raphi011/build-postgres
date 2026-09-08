@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -15,7 +16,6 @@ import (
 	"github.com/raphi011/build-postgres/internal/executor"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
 	"github.com/raphi011/build-postgres/internal/index"
-	"github.com/raphi011/build-postgres/internal/planner"
 	"github.com/raphi011/build-postgres/internal/sql/analyzer"
 	"github.com/raphi011/build-postgres/internal/sql/lexer"
 	"github.com/raphi011/build-postgres/internal/sql/parser"
@@ -188,7 +188,6 @@ func TestErrors(t *testing.T) {
 		{"select a from t where 2147483647 + a > 0", `integer out of range`, 0, 0, expr.ErrOutOfRange},
 		{"select * from t limit -1", `LIMIT must not be negative`, 0, 0, executor.ErrInvalidRowCount},
 		{"update t set a = b", `null value in column "a" of relation "t" violates not-null constraint`, 0, 0, executor.ErrNotNull},
-		{"select * from t, t as u", `joins are not supported until chapter 15`, 0, 0, planner.ErrJoin},
 		{"create index j on nope (a)", `relation "nope" does not exist`, 0, 0, analyzer.ErrUndefinedTable},
 		{"create index j on t (nope)", `column "nope" does not exist`, 0, 0, analyzer.ErrUndefinedColumn},
 		{"create index j on i (a)", `"i" is an index`, 0, 0, analyzer.ErrWrongObjectType},
@@ -773,4 +772,234 @@ func TestPlansAgree(t *testing.T) {
 	if len(r.Rows) == 0 || r.Rows[0][0] != "Index Scan using t_a on t" {
 		t.Errorf("a = 7 planned as %v", r.Rows)
 	}
+}
+
+// Chapter 15: joins.
+
+func TestJoins(t *testing.T) {
+	s := newSession(t)
+	exec(t, s, "create table t (a int4 primary key, b text)")
+	exec(t, s, "create table u (a int4, c int8, d text)")
+	exec(t, s, "insert into t values (1, 'x'), (2, 'y'), (3, 'z'), (4, null)")
+	exec(t, s, "insert into u values (1, 10, 'p'), (1, 11, 'q'), (3, 30, 'r'), (null, 40, 's'), (5, 50, 't')")
+	cases := []struct{ src, want string }{
+		// Output columns follow the range table whatever the join order;
+		// duplicate names are printed as they are.
+		{"select * from t join u on t.a = u.a order by t.a, u.c", lines(
+			` a | b | a | c  | d `,
+			`---+---+---+----+---`,
+			` 1 | x | 1 | 10 | p`,
+			` 1 | x | 1 | 11 | q`,
+			` 3 | z | 3 | 30 | r`,
+			`(3 rows)`, ``)},
+		{"select t.b, u.d from t, u where u.a = t.a and u.c > 10 order by 1", lines(
+			` b | d `,
+			`---+---`,
+			` x | q`,
+			` z | r`,
+			`(2 rows)`, ``)},
+		{"select t.a, u.a from t join u on t.a < u.a order by 1, 2", lines(
+			` a | a `,
+			`---+---`,
+			` 1 | 3`,
+			` 1 | 5`,
+			` 2 | 3`,
+			` 2 | 5`,
+			` 3 | 5`,
+			` 4 | 5`,
+			`(6 rows)`, ``)},
+		// A NULL key matches nothing; a cross join matches everything.
+		{"select u1.c, u2.c from u as u1 join u as u2 on u1.a = u2.a and u1.c < u2.c order by 1, 2", lines(
+			` c  | c  `,
+			`----+----`,
+			` 10 | 11`,
+			`(1 row)`, ``)},
+		{"select t.b from t join u on true where u.d = 's' order by 1", lines(
+			` b `,
+			`---`,
+			` x`,
+			` y`,
+			` z`,
+			` `,
+			`(4 rows)`, ``)},
+		{"select t.a as x, t2.a as y from t, t as t2 where t.a = t2.a + 1 order by 1", lines(
+			` x | y `,
+			`---+---`,
+			` 2 | 1`,
+			` 3 | 2`,
+			` 4 | 3`,
+			`(3 rows)`, ``)},
+		{"select t.a, u.c, t2.b from t join u on t.a = u.a join t as t2 on t2.a = u.a + 1 order by 1, 2", lines(
+			` a | c  | b `,
+			`---+----+---`,
+			` 1 | 10 | y`,
+			` 1 | 11 | y`,
+			` 3 | 30 | `,
+			`(3 rows)`, ``)},
+		{"select * from t join u on t.a = u.c", lines(
+			` a | b | a | c | d `,
+			`---+---+---+---+---`,
+			`(0 rows)`, ``)},
+	}
+	for _, c := range cases {
+		if got := exec(t, s, c.src).String(); got != c.want {
+			t.Errorf("%s =\n%s\nwant\n%s", c.src, got, c.want)
+		}
+	}
+	// The result reports the joined row count.
+	if r := exec(t, s, "select 1 from t, u"); r.Tag != "SELECT 20" || len(r.Rows) != 20 {
+		t.Errorf("cross join: %s, %d rows", r.Tag, len(r.Rows))
+	}
+	// Errors are the analyzer's.
+	for _, c := range []struct {
+		src string
+		err error
+	}{
+		{"select a from t, u", analyzer.ErrAmbiguousColumn},
+		{"select * from t join u on t.a", analyzer.ErrTypeMismatch},
+		{"select * from t join t on true", analyzer.ErrDuplicateAlias},
+		{"select * from t join nope on true", analyzer.ErrUndefinedTable},
+	} {
+		if _, err := s.Exec(c.src); !errors.Is(err, c.err) {
+			t.Errorf("%s: %v, want %v", c.src, err, c.err)
+		}
+	}
+}
+
+// TestJoinPlans: the join method changes with what the planner knows
+// about the tables.
+func TestJoinPlans(t *testing.T) {
+	s := newSession(t)
+	exec(t, s, "create table t (a int4 primary key, b text)")
+	exec(t, s, "create table u (a int4 primary key, c int4)")
+	explain := func(sql string) string {
+		t.Helper()
+		var b strings.Builder
+		for _, row := range exec(t, s, "explain (costs off) "+sql).Rows {
+			b.WriteString(row[0].(string) + "\n")
+		}
+		return b.String()
+	}
+	// Never analysed, both tables are taken to hold ten pages: hashing
+	// the smaller side wins.
+	join := "select * from t join u on t.a = u.a"
+	if got := explain(join); got != lines("Hash Join", "  Hash Cond: (u.a = t.a)", "  ->  Seq Scan on u", "  ->  Hash", "        ->  Seq Scan on t") {
+		t.Errorf("never analysed:\n%s", got)
+	}
+	if got := explain("select * from t, u"); got != lines("Nested Loop", "  ->  Seq Scan on u", "  ->  Materialize", "        ->  Seq Scan on t") {
+		t.Errorf("cross join:\n%s", got)
+	}
+	// With two rows known to be in t, probing u's primary key per row is
+	// cheaper than hashing u.
+	exec(t, s, "insert into t values (1, 'x'), (2, 'y')")
+	exec(t, s, "analyze t")
+	if got := explain(join); got != lines("Nested Loop", "  ->  Seq Scan on t", "  ->  Index Scan using u_pkey on u", "        Index Cond: (u.a = t.a)") {
+		t.Errorf("small outer:\n%s", got)
+	}
+	r := exec(t, s, "explain "+join)
+	want := lines(`                              QUERY PLAN                              `,
+		`----------------------------------------------------------------------`,
+		` Nested Loop  (cost=0.15..17.39 rows=2 width=44)`,
+		`   ->  Seq Scan on t  (cost=0.00..1.02 rows=2 width=36)`,
+		`   ->  Index Scan using u_pkey on u  (cost=0.15..8.17 rows=1 width=8)`,
+		`         Index Cond: (u.a = t.a)`,
+		`(4 rows)`,
+		``)
+	if got := r.String(); got != want {
+		t.Errorf("explain =\n%s\nwant\n%s", got, want)
+	}
+	// Both small and analysed: a hash join again.
+	exec(t, s, "insert into u values (1, 10), (2, 20), (3, 30)")
+	exec(t, s, "analyze")
+	if got := explain(join); got != lines("Hash Join", "  Hash Cond: (u.a = t.a)", "  ->  Seq Scan on u", "  ->  Hash", "        ->  Seq Scan on t") {
+		t.Errorf("both analysed:\n%s", got)
+	}
+	if got := exec(t, s, join+" order by t.a").String(); got != lines(
+		` a | b | a | c  `,
+		`---+---+---+----`,
+		` 1 | x | 1 | 10`,
+		` 2 | y | 2 | 20`,
+		`(2 rows)`, ``) {
+		t.Errorf("join =\n%s", got)
+	}
+}
+
+// TestJoinOracle: for random rows, the rows a join returns are the
+// pairs of the cross product that satisfy the qual, whatever plan the
+// planner picks; the qual is evaluated in Go as the oracle.
+func TestJoinOracle(t *testing.T) {
+	s := newSession(t)
+	exec(t, s, "create table t (a int4, b text)")
+	exec(t, s, "create table u (x int4 primary key, y text)")
+	exec(t, s, "create index t_a on t (a)")
+	rng := rand.New(rand.NewSource(15))
+	var tvals, uvals []string
+	for i := 0; i < 200; i++ {
+		b := fmt.Sprintf("'s%d'", rng.Intn(5))
+		if rng.Intn(8) == 0 {
+			b = "null"
+		}
+		a := strconv.Itoa(rng.Intn(60))
+		if rng.Intn(8) == 0 {
+			a = "null"
+		}
+		tvals = append(tvals, fmt.Sprintf("(%s, %s)", a, b))
+	}
+	for x := 0; x < 50; x++ {
+		uvals = append(uvals, fmt.Sprintf("(%d, 's%d')", x, rng.Intn(5)))
+	}
+	exec(t, s, "insert into t values "+strings.Join(tvals, ", "))
+	exec(t, s, "insert into u values "+strings.Join(uvals, ", "))
+	trows, urows := exec(t, s, "select * from t").Rows, exec(t, s, "select * from u").Rows
+	eq := func(a, b tuple.Datum) bool { return a != nil && b != nil && a == b }
+	lt := func(a, b tuple.Datum) bool { return a != nil && b != nil && a.(int32) < b.(int32) }
+	preds := []struct {
+		sql string
+		ok  func(tr, ur []tuple.Datum) bool
+	}{
+		{"t.a = u.x", func(tr, ur []tuple.Datum) bool { return eq(tr[0], ur[0]) }},
+		{"u.x = t.a and t.b = u.y", func(tr, ur []tuple.Datum) bool { return eq(tr[0], ur[0]) && eq(tr[1], ur[1]) }},
+		{"t.a < u.x and u.x < t.a + 3", func(tr, ur []tuple.Datum) bool {
+			return lt(tr[0], ur[0]) && ur[0] != nil && tr[0] != nil && ur[0].(int32) < tr[0].(int32)+3
+		}},
+		{"t.a = u.x or t.b = u.y", func(tr, ur []tuple.Datum) bool { return eq(tr[0], ur[0]) || eq(tr[1], ur[1]) }},
+		{"t.a + 1 = u.x and t.b <> u.y", func(tr, ur []tuple.Datum) bool {
+			return tr[0] != nil && ur[0] != nil && tr[0].(int32)+1 == ur[0].(int32) && tr[1] != nil && ur[1] != nil && tr[1] != ur[1]
+		}},
+	}
+	check := func(sql string, ok func(tr, ur []tuple.Datum) bool) {
+		t.Helper()
+		var want []string
+		for _, tr := range trows {
+			for _, ur := range urows {
+				if ok(tr, ur) {
+					want = append(want, fmt.Sprint(tr, ur))
+				}
+			}
+		}
+		var got []string
+		for _, row := range exec(t, s, "select * from t, u where "+sql).Rows {
+			got = append(got, fmt.Sprint(row[:2], row[2:]))
+		}
+		sort.Strings(want)
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %d rows, oracle %d", sql, len(got), len(want))
+		}
+		if len(want) == 0 || len(want) == len(trows)*len(urows) {
+			t.Errorf("%s: %d of %d pairs; weak test", sql, len(want), len(trows)*len(urows))
+		}
+	}
+	for _, p := range preds {
+		check(p.sql, p.ok)
+	}
+	// With t analysed and filtered down to a row or two, the planner
+	// probes u's primary key per outer row instead of hashing.
+	exec(t, s, "analyze t")
+	filtered := "t.a = u.x and t.b = 's0'"
+	if r := exec(t, s, "explain (costs off) select * from t, u where "+filtered); len(r.Rows) < 4 ||
+		r.Rows[0][0] != "Nested Loop" || r.Rows[3][0] != "  ->  Index Scan using u_pkey on u" {
+		t.Errorf("%s planned as %v", filtered, r.Rows)
+	}
+	check(filtered, func(tr, ur []tuple.Datum) bool { return eq(tr[0], ur[0]) && tr[1] == "s0" })
 }

@@ -2,6 +2,7 @@ package planner
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -186,8 +187,6 @@ func TestPlanErrors(t *testing.T) {
 		src string
 		err error
 	}{
-		{"select * from t, t as u", ErrJoin},
-		{"select 1 from t join t as u on t.a = u.a", ErrJoin},
 		{"create table x (a int4)", ErrUtility},
 		{"drop table t", ErrUtility},
 		{"analyze t", ErrUtility},
@@ -203,6 +202,24 @@ func TestPlanErrors(t *testing.T) {
 		if !errors.Is(err, c.err) {
 			t.Errorf("Plan(%q) = %v, want %v", c.src, err, c.err)
 		}
+	}
+}
+
+// TestTooManyRelations checks that a FROM list past MaxJoinRelations is
+// refused rather than planned, the join search being exponential.
+func TestTooManyRelations(t *testing.T) {
+	from := func(n int) string {
+		names := make([]string, n)
+		for i := range names {
+			names[i] = fmt.Sprintf("t as t%d", i)
+		}
+		return "select 1 from " + strings.Join(names, ", ")
+	}
+	if _, err := Plan(analyze(t, from(3))); err != nil {
+		t.Fatalf("Plan of 3 relations: %v", err)
+	}
+	if _, err := Plan(analyze(t, from(MaxJoinRelations+1))); !errors.Is(err, ErrTooManyRelations) {
+		t.Errorf("Plan of %d relations = %v, want ErrTooManyRelations", MaxJoinRelations+1, err)
 	}
 }
 
@@ -408,5 +425,339 @@ func TestIndexScanShape(t *testing.T) {
 	p, _ = Plan(analyze(t, "select * from u where a = c"))
 	if _, ok := p.(*plan.Project).Input.(*plan.Filter).Input.(*plan.SeqScan); !ok {
 		t.Errorf("a = c planned as %T", p.(*plan.Project).Input)
+	}
+}
+
+// Chapter 15: joins.
+
+// TestJoinGolden pins the join method, the join order, and where each
+// qual lands, without costs.
+func TestJoinGolden(t *testing.T) {
+	cases := []struct{ src, want string }{
+		// A cross join is a nested loop over a materialised inner side.
+		{"select * from t, u", `
+Nested Loop
+  ->  Seq Scan on t
+  ->  Materialize
+        ->  Seq Scan on u`},
+		// An equality between the two sides makes a hash join; the hash
+		// cond has the outer side on the left whichever way it was written.
+		{"select * from t join u on t.a = u.a", `
+Hash Join
+  Hash Cond: (t.a = u.a)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Seq Scan on u`},
+		{"select * from t join u on u.a = t.a", `
+Hash Join
+  Hash Cond: (t.a = u.a)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Seq Scan on u`},
+		{"select * from t join u on t.a = u.c", `
+Hash Join
+  Hash Cond: (t.a::int8 = u.c)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Seq Scan on u`},
+		{"select * from t join u on t.a = u.a and t.b = u.b", `
+Hash Join
+  Hash Cond: ((u.a = t.a) AND (u.b = t.b))
+  ->  Seq Scan on u
+  ->  Hash
+        ->  Seq Scan on t`},
+		// Anything else stays a nested loop with a Join Filter.
+		{"select * from t join u on t.a < u.a", `
+Nested Loop
+  Join Filter: (t.a < u.a)
+  ->  Seq Scan on t
+  ->  Materialize
+        ->  Seq Scan on u`},
+		{"select * from t, u where t.a = u.a or t.b = u.b", `
+Nested Loop
+  Join Filter: ((t.a = u.a) OR (t.b = u.b))
+  ->  Seq Scan on t
+  ->  Materialize
+        ->  Seq Scan on u`},
+		// A qual on one relation goes below the join; a mixed one stays
+		// at the join.
+		{"select * from t join u on t.a = u.a where t.b = 'x' and u.c > 1", `
+Hash Join
+  Hash Cond: (u.a = t.a)
+  ->  Seq Scan on u
+        Filter: (u.c > 1::int8)
+  ->  Hash
+        ->  Seq Scan on t
+              Filter: (t.b = 'x')`},
+		{"select * from t, u where t.a = u.a and u.c = t.a", `
+Hash Join
+  Hash Cond: ((t.a = u.a) AND (t.a::int8 = u.c))
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Seq Scan on u`},
+		{"select * from t, u where true", `
+Nested Loop
+  ->  Seq Scan on t
+        Filter: TRUE
+  ->  Materialize
+        ->  Seq Scan on u`},
+		// A big indexed inner: a nested loop probing the index once per
+		// outer row, with the join qual as the index condition.
+		{"select * from small join big on small.a = big.c", `
+Nested Loop
+  ->  Seq Scan on small
+  ->  Index Scan using big_c_key on big
+        Index Cond: (big.c = small.a::int8)`},
+		{"select * from small, big where big.c = small.a and big.b = 'x'", `
+Nested Loop
+  ->  Seq Scan on small
+  ->  Index Scan using big_c_key on big
+        Index Cond: (big.c = small.a::int8)
+        Filter: (big.b = 'x')`},
+		// A non-unique index on big does not pay: the hash join wins,
+		// hashing the small side.
+		{"select * from small join big on small.a = big.a", `
+Hash Join
+  Hash Cond: (big.a = small.a)
+  ->  Seq Scan on big
+  ->  Hash
+        ->  Seq Scan on small`},
+		// The outer side may be an index scan of its own.
+		{"select * from big, big as b2 where big.a = b2.c and big.c = 5", `
+Nested Loop
+  ->  Index Scan using big_c_key on big
+        Index Cond: (big.c = 5::int8)
+  ->  Index Scan using big_c_key on big b2
+        Index Cond: (b2.c = big.a::int8)`},
+		// Three relations: a chain of parameterised scans, the qual over
+		// the first and last at the top.
+		{"select * from small, big, big as b2 where small.a = big.c and big.a = b2.c and b2.b = small.b", `
+Nested Loop
+  Join Filter: (b2.b = small.b)
+  ->  Nested Loop
+        ->  Seq Scan on small
+        ->  Index Scan using big_c_key on big
+              Index Cond: (big.c = small.a::int8)
+  ->  Index Scan using big_c_key on big b2
+        Index Cond: (b2.c = big.a::int8)`},
+		// A qual over three relations waits for the join that has them all.
+		{"select * from t, u, small where t.a + u.a = small.a", `
+Hash Join
+  Hash Cond: ((t.a + u.a) = small.a)
+  ->  Nested Loop
+        ->  Seq Scan on t
+        ->  Materialize
+              ->  Seq Scan on u
+  ->  Hash
+        ->  Seq Scan on small`},
+		{"select * from t join u on t.a = u.a join big on u.c = big.c", `
+Hash Join
+  Hash Cond: (t.a = u.a)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Hash Join
+              Hash Cond: (big.c = u.c)
+              ->  Seq Scan on big
+              ->  Hash
+                    ->  Seq Scan on u`},
+		{"select * from t, u, small, big where t.a = u.a and u.c = small.c and small.a = big.c", `
+Hash Join
+  Hash Cond: (t.a = u.a)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Nested Loop
+              ->  Hash Join
+                    Hash Cond: (u.c = small.c)
+                    ->  Seq Scan on u
+                    ->  Hash
+                          ->  Seq Scan on small
+              ->  Index Scan using big_c_key on big
+                    Index Cond: (big.c = small.a::int8)`},
+		// Self joins are joins like any other.
+		{"select * from t, t as t2 where t.a = t2.a", `
+Hash Join
+  Hash Cond: (t.a = t2.a)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Seq Scan on t t2`},
+		// ORDER BY sorts above the join, unless a nested loop's outer side
+		// delivers the order; a hash join delivers none.
+		{"select * from t join u on t.a = u.a order by u.a", `
+Sort
+  Sort Key: u.a
+  ->  Hash Join
+        Hash Cond: (t.a = u.a)
+        ->  Seq Scan on t
+        ->  Hash
+              ->  Seq Scan on u`},
+		{"select * from small join big on small.a = big.c order by small.a limit 1", `
+Limit
+  ->  Nested Loop
+        ->  Index Scan using small_a on small
+        ->  Index Scan using big_c_key on big
+              Index Cond: (big.c = small.a::int8)`},
+		// A LIMIT favours the plan that starts early: a nested loop with
+		// no setup over a hash join that must build its table first.
+		{"select u.a from t, u where t.a = u.a limit 1", `
+Limit
+  ->  Nested Loop
+        Join Filter: (t.a = u.a)
+        ->  Seq Scan on t
+        ->  Materialize
+              ->  Seq Scan on u`},
+	}
+	for _, c := range cases {
+		p, err := Plan(analyze(t, c.src))
+		if err != nil {
+			t.Errorf("Plan(%q): %v", c.src, err)
+			continue
+		}
+		got := strings.Join(plan.Explain(p), "\n")
+		if want := strings.TrimPrefix(c.want, "\n"); got != want {
+			t.Errorf("Plan(%q) =\n%s\nwant\n%s", c.src, got, want)
+		}
+	}
+}
+
+// TestJoinEstimates pins the join cost model: the numbers follow the
+// formulas in the chapter 15 README.
+func TestJoinEstimates(t *testing.T) {
+	cases := []struct{ src, want string }{
+		{"select * from t, u", `
+Nested Loop  (cost=0.00..16183.89 rows=1291075 width=80)
+  ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+  ->  Materialize  (cost=0.00..26.12 rows=1075 width=44)
+        ->  Seq Scan on u  (cost=0.00..20.75 rows=1075 width=44)`},
+		// Rows: 1201 * 1075 / 200 distinct values.
+		{"select * from t join u on t.a = u.a", `
+Hash Join  (cost=34.19..285.88 rows=6455 width=80)
+  Hash Cond: (t.a = u.a)
+  ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+  ->  Hash  (cost=20.75..20.75 rows=1075 width=44)
+        ->  Seq Scan on u  (cost=0.00..20.75 rows=1075 width=44)`},
+		// u.c is unique: one row per t row.
+		{"select * from t join u on t.a = u.c", `
+Hash Join  (cost=34.19..74.21 rows=1201 width=80)
+  Hash Cond: (t.a::int8 = u.c)
+  ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+  ->  Hash  (cost=20.75..20.75 rows=1075 width=44)
+        ->  Seq Scan on u  (cost=0.00..20.75 rows=1075 width=44)`},
+		{"select * from t join u on t.a < u.a", `
+Nested Loop  (cost=0.00..19411.57 rows=430358 width=80)
+  Join Filter: (t.a < u.a)
+  ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+  ->  Materialize  (cost=0.00..26.12 rows=1075 width=44)
+        ->  Seq Scan on u  (cost=0.00..20.75 rows=1075 width=44)`},
+		{"select * from t join u on t.a = u.a where t.b = 'x' and u.c > 1", `
+Hash Join  (cost=25.09..49.98 rows=11 width=80)
+  Hash Cond: (u.a = t.a)
+  ->  Seq Scan on u  (cost=0.00..23.44 rows=358 width=44)
+        Filter: (u.c > 1::int8)
+  ->  Hash  (cost=25.01..25.01 rows=6 width=36)
+        ->  Seq Scan on t  (cost=0.00..25.01 rows=6 width=36)
+              Filter: (t.b = 'x')`},
+		// The parameterised scan: one row at 8.19 per outer row.
+		{"select * from small join big on small.a = big.c", `
+Nested Loop  (cost=0.17..821.75 rows=100 width=88)
+  ->  Seq Scan on small  (cost=0.00..2.00 rows=100 width=44)
+  ->  Index Scan using big_c_key on big  (cost=0.17..8.19 rows=1 width=44)
+        Index Cond: (big.c = small.a::int8)`},
+		{"select * from small join big on small.a = big.a", `
+Hash Join  (cost=3.25..6878.25 rows=50000 width=88)
+  Hash Cond: (big.a = small.a)
+  ->  Seq Scan on big  (cost=0.00..6000.00 rows=100000 width=44)
+  ->  Hash  (cost=2.00..2.00 rows=100 width=44)
+        ->  Seq Scan on small  (cost=0.00..2.00 rows=100 width=44)`},
+		{"select * from small join big on small.a = big.c order by small.a limit 1", `
+Limit  (cost=0.31..8.64 rows=1 width=88)
+  ->  Nested Loop  (cost=0.31..833.39 rows=100 width=88)
+        ->  Index Scan using small_a on small  (cost=0.14..13.64 rows=100 width=44)
+        ->  Index Scan using big_c_key on big  (cost=0.17..8.19 rows=1 width=44)
+              Index Cond: (big.c = small.a::int8)`},
+		{"select * from t, u, small where t.a + u.a = small.a", `
+Hash Join  (cost=3.25..29097.89 rows=645538 width=124)
+  Hash Cond: ((t.a + u.a) = small.a)
+  ->  Nested Loop  (cost=0.00..16183.89 rows=1291075 width=80)
+        ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+        ->  Materialize  (cost=0.00..26.12 rows=1075 width=44)
+              ->  Seq Scan on u  (cost=0.00..20.75 rows=1075 width=44)
+  ->  Hash  (cost=2.00..2.00 rows=100 width=44)
+        ->  Seq Scan on small  (cost=0.00..2.00 rows=100 width=44)`},
+	}
+	for _, c := range cases {
+		p, err := Plan(analyze(t, c.src))
+		if err != nil {
+			t.Errorf("Plan(%q): %v", c.src, err)
+			continue
+		}
+		got := strings.Join(plan.ExplainCosts(p), "\n")
+		if want := strings.TrimPrefix(c.want, "\n"); got != want {
+			t.Errorf("Plan(%q) =\n%s\nwant\n%s", c.src, got, want)
+		}
+	}
+}
+
+// TestJoinShape checks what the EXPLAIN output hides: the node types,
+// the join's range order, the parameterised scan's quals, and that
+// every node carries an estimate.
+func TestJoinShape(t *testing.T) {
+	p, err := Plan(analyze(t, "select big.b from small, big where big.c = small.a and big.b is not null order by small.a limit 3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lim := p.(*plan.Limit)
+	proj := lim.Input.(*plan.Project)
+	nl, ok := proj.Input.(*plan.NestLoop)
+	if !ok {
+		t.Fatalf("under Project is %T, want *plan.NestLoop (no Sort: the outer index provides the order)", proj.Input)
+	}
+	if _, ok := nl.Outer.(*plan.IndexScan); !ok {
+		t.Fatalf("outer is %T, want *plan.IndexScan", nl.Outer)
+	}
+	filter, ok := nl.Inner.(*plan.Filter)
+	if !ok {
+		t.Fatalf("inner is %T, want *plan.Filter", nl.Inner)
+	}
+	scan := filter.Input.(*plan.IndexScan)
+	if scan.Index.Name != "big_c_key" || len(scan.Quals) != 1 || scan.Quals[0].String() != "(big.c = small.a::int8)" {
+		t.Errorf("inner scan = %s using %s", scan.Quals, scan.Index.Name)
+	}
+	if v := scan.Quals[0].(*query.OpExpr).Right.(*query.Cast).X.(*query.Var); v.Rel != 0 {
+		t.Errorf("parameter refers to range entry %d, want 0 (small)", v.Rel)
+	}
+	if nl.Qual != nil {
+		t.Errorf("join filter = %s, want none: the index scan enforces the join qual", nl.Qual)
+	}
+	if r := nl.Range(); len(r) != 2 || r[0].Alias != "small" || r[1].Alias != "big" {
+		t.Errorf("join range = %v", r)
+	}
+	for _, n := range []plan.Node{lim, proj, nl, nl.Outer, filter, scan} {
+		if n.Estimate().TotalCost <= 0 || n.Estimate().Rows < 1 {
+			t.Errorf("%T has no estimate: %+v", n, n.Estimate())
+		}
+	}
+
+	// A hash join's inner is a Hash; its range is outer then inner, which
+	// here is u then t: the row layout no longer follows the range table.
+	p, _ = Plan(analyze(t, "select t.b from t join u on t.a = u.a where t.b = 'x'"))
+	hj := p.(*plan.Project).Input.(*plan.HashJoin)
+	hash, ok := hj.Inner.(*plan.Hash)
+	if !ok {
+		t.Fatalf("hash join inner is %T, want *plan.Hash", hj.Inner)
+	}
+	if f, ok := hash.Input.(*plan.Filter); !ok {
+		t.Errorf("under Hash is %T, want *plan.Filter", hash.Input)
+	} else if _, ok := f.Input.(*plan.SeqScan); !ok {
+		t.Errorf("under Filter is %T, want *plan.SeqScan", f.Input)
+	}
+	if r := hj.Range(); len(r) != 2 || r[0].Alias != "u" || r[1].Alias != "t" || r[0].Index != 1 || r[1].Index != 0 {
+		t.Errorf("hash join range = %v", r)
+	}
+	if h := hash.Estimate(); h.StartupCost != h.TotalCost || h.Rows != hash.Input.Estimate().Rows {
+		t.Errorf("Hash estimate = %+v, want startup = total and the input's rows", h)
+	}
+	// Four relations plan without complaint.
+	if _, err := Plan(analyze(t, "select 1 from t, u, small, big where t.a = u.a and u.a = small.a and small.a = big.a")); err != nil {
+		t.Errorf("four relations: %v", err)
 	}
 }

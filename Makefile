@@ -16,8 +16,9 @@ CH11 = $(CH10) ./internal/plan/... ./internal/planner/... ./internal/executor/..
 CH12 = $(CH11) ./internal/btree/...
 CH13 = $(CH12) ./internal/index/...
 CH14 = $(CH13)
+CH15 = $(CH14)
 
-.PHONY: build test vet regress test-ch01 test-ch02 test-ch03 test-ch04 test-ch05 test-ch06 test-ch07 test-ch08 test-ch09 test-ch10 test-ch11 test-ch12 test-ch13 test-ch14
+.PHONY: build test vet regress test-ch01 test-ch02 test-ch03 test-ch04 test-ch05 test-ch06 test-ch07 test-ch08 test-ch09 test-ch10 test-ch11 test-ch12 test-ch13 test-ch14 test-ch15
 
 build:
 	$(GO) build ./...
@@ -61,3 +62,5 @@ test-ch13:
 	REGRESS_CHAPTER=13 $(GO) test -race $(CH13)
 test-ch14:
 	REGRESS_CHAPTER=14 $(GO) test -race $(CH14)
+test-ch15:
+	REGRESS_CHAPTER=15 $(GO) test -race $(CH15)

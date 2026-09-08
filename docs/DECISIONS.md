@@ -191,3 +191,20 @@ the chapter is about. Two consequences are visible in `EXPLAIN`: row
 estimates are the same for every value, and small analysed tables scan
 sequentially even for an equality on an indexed column, since a fetch of
 0.5 percent of the rows costs more than reading one page.
+
+## D22: Join selectivity from a default distinct count
+
+Chapter 14 gave every predicate a constant selectivity. A join needs one
+more number, because the rows an equality join keeps depend on how many
+distinct values the key has, and a constant would make every join look
+alike. The planner uses PostgreSQL's fallback in `eqjoinsel`: a column
+has as many distinct values as its table has rows when a unique index
+says so or the table is smaller than `DefaultNumDistinct` (200), and
+200 otherwise; the join keeps one row in the larger of the two counts.
+The same count sizes hash buckets (`estimate_hash_bucket_stats`). It is
+the last piece of `pg_statistic` the planner does without: with it, a
+primary-key join estimates one match per outer row and a join between
+two large unanalysed tables one in 200, which is enough for the planner
+to prefer hashing a small table and probing an index of a large one.
+Real distinct counts would come from the sampling pass that histograms
+need, which stays out of scope.

@@ -598,3 +598,30 @@ func randInt64(rng *rand.Rand) int64 {
 	}
 	return int64(rng.Uint64())
 }
+
+// Chapter 15: a row that holds range entries out of range table order,
+// or only some of them, is laid out by their Index.
+func TestLayoutJoinOrder(t *testing.T) {
+	tEntry := &query.RangeEntry{Index: 0, Alias: "t", Rel: cat["t"]}
+	uEntry := &query.RangeEntry{Index: 1, Alias: "u", Rel: cat["u"]}
+	l := NewLayout([]*query.RangeEntry{uEntry, tEntry})
+	if got := []int(l); len(got) != 3 || got[0] != 2 || got[1] != 0 || got[2] != 6 {
+		t.Fatalf("Layout(u, t) = %v, want [2 0 6]", got)
+	}
+	if l.Width() != 6 {
+		t.Errorf("Width = %d, want 6", l.Width())
+	}
+	if s := l.Slot(&query.Var{Rel: 1, Attr: 1}); s != 1 {
+		t.Errorf("Slot(u.s) = %d, want 1", s)
+	}
+	if s := l.Slot(&query.Var{Rel: 0, Attr: 2}); s != 4 {
+		t.Errorf("Slot(t.s) = %d, want 4", s)
+	}
+	only := NewLayout([]*query.RangeEntry{uEntry})
+	if got := []int(only); len(got) != 3 || got[0] != -1 || got[1] != 0 || got[2] != 2 {
+		t.Fatalf("Layout(u) = %v, want [-1 0 2]", got)
+	}
+	if only.Width() != 2 || only.Slot(&query.Var{Rel: 1, Attr: 1}) != 1 {
+		t.Errorf("Layout(u): width %d, Slot(u.s) %d", only.Width(), only.Slot(&query.Var{Rel: 1, Attr: 1}))
+	}
+}

@@ -190,3 +190,130 @@ Insert on t  (cost=0.00..0.00 rows=0 width=0)
 		t.Error("a fresh node has a non-zero estimate")
 	}
 }
+
+// Chapter 15: joins.
+
+var (
+	uInfo = &catalog.RelationInfo{OID: 16386, Name: "u", Kind: catalog.RelKindTable, Desc: tuple.NewDesc(
+		tuple.Attr{Name: "x", Type: tuple.Int4},
+		tuple.Attr{Name: "y", Type: tuple.Int8},
+	)}
+	u1   = &query.RangeEntry{Index: 1, Alias: "u", Rel: uInfo}
+	t2   = &query.RangeEntry{Index: 2, Alias: "t2", Rel: tInfo}
+	ux   = &query.Var{Rel: 1, Attr: 0, Typ: tuple.Int4, Alias: "u", Column: "x"}
+	aEqX = &query.OpExpr{Op: ast.Eq, Typ: tuple.Bool, Left: va, Right: ux}
+	aLtX = &query.OpExpr{Op: ast.Lt, Typ: tuple.Bool, Left: va, Right: ux}
+)
+
+func TestJoinRange(t *testing.T) {
+	ts, us := &SeqScan{Rel: t0}, &SeqScan{Rel: u1}
+	for _, n := range []Node{
+		&NestLoop{Outer: ts, Inner: &Materialize{Input: us}},
+		&HashJoin{Outer: ts, Inner: &Hash{Input: us}},
+	} {
+		if r := n.Range(); len(r) != 2 || r[0] != t0 || r[1] != u1 {
+			t.Errorf("%T.Range() = %v, want [t u]", n, r)
+		}
+	}
+	// The order is the join's, not the range table's.
+	if r := (&NestLoop{Outer: us, Inner: ts}).Range(); len(r) != 2 || r[0] != u1 || r[1] != t0 {
+		t.Errorf("NestLoop(u, t).Range() = %v, want [u t]", r)
+	}
+	for _, n := range []Node{&Hash{Input: us}, &Materialize{Input: us}} {
+		if r := n.Range(); len(r) != 1 || r[0] != u1 {
+			t.Errorf("%T.Range() = %v, want [u]", n, r)
+		}
+	}
+	// A join's range is a fresh slice: the children's stay as they were.
+	nl := &NestLoop{Outer: &NestLoop{Outer: ts, Inner: us}, Inner: &SeqScan{Rel: t2}}
+	_ = append(nl.Outer.Range(), t2)
+	if r := nl.Range(); len(r) != 3 || r[2] != t2 || len(nl.Outer.Range()) != 2 {
+		t.Errorf("nested Range() = %v", r)
+	}
+}
+
+func TestExplainJoins(t *testing.T) {
+	ts, us := &SeqScan{Rel: t0}, &SeqScan{Rel: u1}
+	cases := []struct {
+		name string
+		plan Node
+		want string
+	}{
+		{"nested loop", &NestLoop{Outer: ts, Inner: &Materialize{Input: us}}, `
+Nested Loop
+  ->  Seq Scan on t
+  ->  Materialize
+        ->  Seq Scan on u`},
+		{"join filter", &NestLoop{Outer: ts, Inner: &Materialize{Input: us}, Qual: aLtX}, `
+Nested Loop
+  Join Filter: (t.a < u.x)
+  ->  Seq Scan on t
+  ->  Materialize
+        ->  Seq Scan on u`},
+		{"parameterised index scan", &NestLoop{Outer: us, Inner: &IndexScan{Rel: t0, Index: iInfo, Quals: []query.Expr{aEqX}}}, `
+Nested Loop
+  ->  Seq Scan on u
+  ->  Index Scan using i on t
+        Index Cond: (t.a = u.x)`},
+		{"hash join", &HashJoin{Outer: ts, Inner: &Hash{Input: us}, HashQuals: []query.Expr{aEqX}}, `
+Hash Join
+  Hash Cond: (t.a = u.x)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Seq Scan on u`},
+		{"hash join, two conds and a filter", &HashJoin{Outer: ts, Inner: &Hash{Input: us},
+			HashQuals: []query.Expr{aEqX, &query.OpExpr{Op: ast.Eq, Typ: tuple.Bool,
+				Left: &query.OpExpr{Op: ast.Add, Typ: tuple.Int4, Left: va, Right: one}, Right: ux}},
+			Qual: aLtX}, `
+Hash Join
+  Hash Cond: ((t.a = u.x) AND ((t.a + 1) = u.x))
+  Join Filter: (t.a < u.x)
+  ->  Seq Scan on t
+  ->  Hash
+        ->  Seq Scan on u`},
+		{"three tables", &Project{Targets: []query.Target{{Name: "a", Expr: va}},
+			Input: &NestLoop{Qual: aLtX,
+				Outer: &HashJoin{Outer: ts, Inner: &Hash{Input: &Filter{Input: us, Qual: aGt1}}, HashQuals: []query.Expr{aEqX}},
+				Inner: &Materialize{Input: &SeqScan{Rel: t2}}}}, `
+Nested Loop
+  Join Filter: (t.a < u.x)
+  ->  Hash Join
+        Hash Cond: (t.a = u.x)
+        ->  Seq Scan on t
+        ->  Hash
+              ->  Seq Scan on u
+                    Filter: (t.a > 1)
+  ->  Materialize
+        ->  Seq Scan on t t2`},
+		{"sort over a join", &Sort{Keys: []query.SortKey{{Expr: ux}},
+			Input: &HashJoin{Outer: ts, Inner: &Hash{Input: us}, HashQuals: []query.Expr{aEqX}}}, `
+Sort
+  Sort Key: u.x
+  ->  Hash Join
+        Hash Cond: (t.a = u.x)
+        ->  Seq Scan on t
+        ->  Hash
+              ->  Seq Scan on u`},
+	}
+	for _, c := range cases {
+		got := strings.Join(Explain(c.plan), "\n")
+		if got != strings.TrimPrefix(c.want, "\n") {
+			t.Errorf("%s:\n%s\nwant\n%s", c.name, got, strings.TrimPrefix(c.want, "\n"))
+		}
+	}
+	// With costs: a Hash node's startup cost is its total cost.
+	hj := &HashJoin{HashQuals: []query.Expr{aEqX},
+		Outer: &SeqScan{Rel: t0, Est: Estimate{TotalCost: 22.01, Rows: 1201, Width: 36}},
+		Inner: &Hash{Input: &SeqScan{Rel: u1, Est: Estimate{TotalCost: 20.75, Rows: 1075, Width: 44}},
+			Est: Estimate{StartupCost: 20.75, TotalCost: 20.75, Rows: 1075, Width: 44}},
+		Est: Estimate{StartupCost: 34.19, TotalCost: 285.88, Rows: 6455, Width: 80}}
+	want := strings.TrimPrefix(`
+Hash Join  (cost=34.19..285.88 rows=6455 width=80)
+  Hash Cond: (t.a = u.x)
+  ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+  ->  Hash  (cost=20.75..20.75 rows=1075 width=44)
+        ->  Seq Scan on u  (cost=0.00..20.75 rows=1075 width=44)`, "\n")
+	if got := strings.Join(ExplainCosts(hj), "\n"); got != want {
+		t.Errorf("hash join with costs:\n%s\nwant\n%s", got, want)
+	}
+}

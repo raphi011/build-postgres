@@ -1,0 +1,215 @@
+-- Join methods and join order are chosen by cost.
+CREATE TABLE t (a int4 PRIMARY KEY, b text);
+CREATE TABLE u (a int4 PRIMARY KEY, c int4);
+CREATE TABLE w (a int4, c int4);
+-- Never analysed: every table is taken to have 10 pages, and hashing
+-- the smaller side beats probing an index once per outer row.
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a;
+        QUERY PLAN         
+---------------------------
+ Hash Join
+   Hash Cond: (u.a = t.a)
+   ->  Seq Scan on u
+   ->  Hash
+         ->  Seq Scan on t
+(5 rows)
+
+EXPLAIN SELECT * FROM t JOIN u ON t.a = u.a;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Hash Join  (cost=37.02..90.23 rows=1201 width=44)
+   Hash Cond: (u.a = t.a)
+   ->  Seq Scan on u  (cost=0.00..32.69 rows=2269 width=8)
+   ->  Hash  (cost=22.01..22.01 rows=1201 width=36)
+         ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN w ON t.a = w.a;
+        QUERY PLAN         
+---------------------------
+ Hash Join
+   Hash Cond: (w.a = t.a)
+   ->  Seq Scan on w
+   ->  Hash
+         ->  Seq Scan on t
+(5 rows)
+
+-- A qual on one table goes below the join; quals over both stay at it.
+EXPLAIN (COSTS OFF) SELECT * FROM t, u WHERE t.a = u.a AND u.c > 10 AND t.b = 'x';
+            QUERY PLAN             
+-----------------------------------
+ Hash Join
+   Hash Cond: (u.a = t.a)
+   ->  Seq Scan on u
+         Filter: (u.c > 10)
+   ->  Hash
+         ->  Seq Scan on t
+               Filter: (t.b = 'x')
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t, u WHERE t.a = u.a AND u.c > t.a;
+         QUERY PLAN         
+----------------------------
+ Hash Join
+   Hash Cond: (u.a = t.a)
+   Join Filter: (u.c > t.a)
+   ->  Seq Scan on u
+   ->  Hash
+         ->  Seq Scan on t
+(6 rows)
+
+-- A cross join, or a join on anything but an equality, is a nested
+-- loop over a materialised inner side.
+EXPLAIN (COSTS OFF) SELECT * FROM t, u;
+        QUERY PLAN         
+---------------------------
+ Nested Loop
+   ->  Seq Scan on u
+   ->  Materialize
+         ->  Seq Scan on t
+(4 rows)
+
+EXPLAIN SELECT * FROM t, u;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Nested Loop  (cost=0.00..34121.07 rows=2725069 width=44)
+   ->  Seq Scan on u  (cost=0.00..32.69 rows=2269 width=8)
+   ->  Materialize  (cost=0.00..28.02 rows=1201 width=36)
+         ->  Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a < u.a;
+         QUERY PLAN         
+----------------------------
+ Nested Loop
+   Join Filter: (t.a < u.a)
+   ->  Seq Scan on u
+   ->  Materialize
+         ->  Seq Scan on t
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a OR t.b = 'x';
+                 QUERY PLAN                  
+---------------------------------------------
+ Nested Loop
+   Join Filter: ((t.a = u.a) OR (t.b = 'x'))
+   ->  Seq Scan on u
+   ->  Materialize
+         ->  Seq Scan on t
+(5 rows)
+
+-- ORDER BY sorts above a hash join; a nested loop keeps its outer
+-- side's order, which a LIMIT makes worth an index scan.
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a ORDER BY t.a;
+           QUERY PLAN            
+---------------------------------
+ Sort
+   Sort Key: t.a
+   ->  Hash Join
+         Hash Cond: (u.a = t.a)
+         ->  Seq Scan on u
+         ->  Hash
+               ->  Seq Scan on t
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a ORDER BY t.a LIMIT 1;
+                QUERY PLAN                
+------------------------------------------
+ Limit
+   ->  Nested Loop
+         ->  Index Scan using t_pkey on t
+         ->  Index Scan using u_pkey on u
+               Index Cond: (u.a = t.a)
+(5 rows)
+
+-- Two rows in t, analysed: probing u's primary key twice is cheaper
+-- than hashing all of u.
+INSERT INTO t VALUES (1, 'x'), (2, 'y');
+ANALYZE t;
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a;
+             QUERY PLAN             
+------------------------------------
+ Nested Loop
+   ->  Seq Scan on t
+   ->  Index Scan using u_pkey on u
+         Index Cond: (u.a = t.a)
+(4 rows)
+
+EXPLAIN SELECT * FROM t JOIN u ON t.a = u.a;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Nested Loop  (cost=0.15..17.39 rows=2 width=44)
+   ->  Seq Scan on t  (cost=0.00..1.02 rows=2 width=36)
+   ->  Index Scan using u_pkey on u  (cost=0.15..8.17 rows=1 width=8)
+         Index Cond: (u.a = t.a)
+(4 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a JOIN w ON w.c = u.c;
+                   QUERY PLAN                   
+------------------------------------------------
+ Hash Join
+   Hash Cond: (w.c = u.c)
+   ->  Seq Scan on w
+   ->  Hash
+         ->  Nested Loop
+               ->  Seq Scan on t
+               ->  Index Scan using u_pkey on u
+                     Index Cond: (u.a = t.a)
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a JOIN t AS t2 ON t2.a = u.c;
+                QUERY PLAN                
+------------------------------------------
+ Hash Join
+   Hash Cond: (u.c = t2.a)
+   ->  Nested Loop
+         ->  Seq Scan on t
+         ->  Index Scan using u_pkey on u
+               Index Cond: (u.a = t.a)
+   ->  Hash
+         ->  Seq Scan on t t2
+(8 rows)
+
+-- Analysed all round, everything is small and a hash join is cheapest.
+INSERT INTO u VALUES (1, 10), (2, 20), (3, 30);
+INSERT INTO w VALUES (1, 10), (2, 10);
+ANALYZE;
+EXPLAIN SELECT * FROM t JOIN u ON t.a = u.a;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Hash Join  (cost=1.04..2.11 rows=2 width=44)
+   Hash Cond: (u.a = t.a)
+   ->  Seq Scan on u  (cost=0.00..1.03 rows=3 width=8)
+   ->  Hash  (cost=1.02..1.02 rows=2 width=36)
+         ->  Seq Scan on t  (cost=0.00..1.02 rows=2 width=36)
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t JOIN u ON t.a = u.a JOIN w ON w.c = u.c;
+           QUERY PLAN            
+---------------------------------
+ Hash Join
+   Hash Cond: (u.c = w.c)
+   ->  Hash Join
+         Hash Cond: (u.a = t.a)
+         ->  Seq Scan on u
+         ->  Hash
+               ->  Seq Scan on t
+   ->  Hash
+         ->  Seq Scan on w
+(9 rows)
+
+-- Whichever plan runs, the rows are the same.
+SELECT * FROM t JOIN u ON t.a = u.a JOIN w ON w.c = u.c ORDER BY t.a, w.a;
+ a | b | a | c  | a | c  
+---+---+---+----+---+----
+ 1 | x | 1 | 10 | 1 | 10
+ 1 | x | 1 | 10 | 2 | 10
+(2 rows)
+
+SELECT * FROM t JOIN u ON t.a + 0 = u.a JOIN w ON w.c + 0 = u.c ORDER BY t.a, w.a;
+ a | b | a | c  | a | c  
+---+---+---+----+---+----
+ 1 | x | 1 | 10 | 1 | 10
+ 1 | x | 1 | 10 | 2 | 10
+(2 rows)
+

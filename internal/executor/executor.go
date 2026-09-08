@@ -36,18 +36,27 @@ func (e *Error) Error() string { return e.Msg }
 func (e *Error) Unwrap() error { return e.Err }
 
 // Row is what nodes pass up: the values plus, for rows read from a heap,
-// the tuple's TID so that ModifyTable can find it again.
+// the tuple's TID so that ModifyTable can find it again. A join's rows
+// have no TID.
 type Row struct {
 	expr.Row
 	TID tuple.TID
 }
 
 // Node is an executor node. Open prepares it, Next returns the next row
-// and false when there are no more, and Close releases what Open took.
-// Next must not be called before Open or after it returned false.
+// and false when there are no more, Rescan restarts an open node so
+// that Next yields its rows from the first again, and Close releases
+// what Open took. Next must not be called before Open or after it
+// returned false, unless Rescan came between. A node whose rows depend
+// on an outer row (a parameterised IndexScan) reads it again on Rescan;
+// a node that stores what it built (Materialize, the hash table of a
+// HashJoin) keeps it.
+// PostgreSQL: ExecProcNode and ExecReScan in execProcnode.c and
+// execAmi.c.
 type Node interface {
 	Open() error
 	Next() (Row, bool, error)
+	Rescan() error
 	Close() error
 }
 
@@ -58,7 +67,8 @@ type Env struct {
 }
 
 // Build turns a plan tree into an executor tree. It does no I/O. Panics
-// on a plan node it does not know.
+// on a plan node it does not know, and on a HashJoin whose Inner is not
+// a Hash.
 // PostgreSQL: ExecInitNode in execProcnode.c.
 func Build(p plan.Node, env *Env) Node {
 	switch p := p.(type) {
