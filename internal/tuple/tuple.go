@@ -3,6 +3,7 @@
 package tuple
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -44,17 +45,45 @@ const (
 
 // String returns the SQL name of the type.
 func (t TypeID) String() string {
-	panic("not implemented")
+	switch t {
+	case Int4:
+		return "int4"
+	case Int8:
+		return "int8"
+	case Bool:
+		return "bool"
+	case Text:
+		return "text"
+	}
+	return fmt.Sprintf("TypeID(%d)", uint8(t))
 }
 
 // Size returns the on-disk size of a value, or -1 for variable-length types.
 func (t TypeID) Size() int {
-	panic("not implemented")
+	switch t {
+	case Int4:
+		return 4
+	case Int8:
+		return 8
+	case Bool:
+		return 1
+	case Text:
+		return -1
+	}
+	panic("tuple: unknown type " + t.String())
 }
 
 // Align returns the alignment of the type within a tuple.
 func (t TypeID) Align() int {
-	panic("not implemented")
+	switch t {
+	case Int4, Text:
+		return 4
+	case Int8:
+		return 8
+	case Bool:
+		return 1
+	}
+	panic("tuple: unknown type " + t.String())
 }
 
 // Attr describes one column.
@@ -115,6 +144,8 @@ func typeError(a Attr, v Datum) error {
 	return fmt.Errorf("%w: column %q is %s, got %T", ErrType, a.Name, a.Type, v)
 }
 
+func alignTo(n, a int) int { return (n + a - 1) &^ (a - 1) }
+
 // Tuple is an encoded heap tuple: header followed by column data.
 type Tuple []byte
 
@@ -124,7 +155,79 @@ type Tuple []byte
 // has the wrong Go type. NotNull is not enforced here.
 // PostgreSQL: heap_form_tuple in heaptuple.c.
 func Form(d *Desc, values []Datum, nulls []bool) (Tuple, error) {
-	panic("not implemented")
+	n := d.Len()
+	if len(values) != n || (nulls != nil && len(nulls) != n) {
+		return nil, ErrArity
+	}
+	hasNull := false
+	for i := range nulls {
+		hasNull = hasNull || nulls[i]
+	}
+
+	// Header.
+	hoff := FixedHeaderSize
+	if hasNull {
+		hoff += (n + 7) / 8
+	}
+	hoff = alignTo(hoff, 8)
+	t := make(Tuple, hoff, hoff+16*n)
+	binary.LittleEndian.PutUint16(t[offInfomask2:], uint16(n)&nattsMask)
+	if hasNull {
+		binary.LittleEndian.PutUint16(t[offInfomask:], HasNull)
+	}
+	t[offHoff] = uint8(hoff)
+	if hasNull {
+		bitmap := t[FixedHeaderSize:]
+		for i, isNull := range nulls {
+			if !isNull {
+				bitmap[i>>3] |= 1 << (i & 7)
+			}
+		}
+	}
+
+	// Data.
+	for i, a := range d.Attrs {
+		if nulls != nil && nulls[i] {
+			continue
+		}
+		v := values[i]
+		pad := alignTo(len(t), a.Type.Align()) - len(t)
+		t = append(t, make([]byte, pad)...)
+		switch a.Type {
+		case Int4:
+			x, ok := v.(int32)
+			if !ok {
+				return nil, typeError(a, v)
+			}
+			t = binary.LittleEndian.AppendUint32(t, uint32(x))
+		case Int8:
+			x, ok := v.(int64)
+			if !ok {
+				return nil, typeError(a, v)
+			}
+			t = binary.LittleEndian.AppendUint64(t, uint64(x))
+		case Bool:
+			x, ok := v.(bool)
+			if !ok {
+				return nil, typeError(a, v)
+			}
+			if x {
+				t = append(t, 1)
+			} else {
+				t = append(t, 0)
+			}
+		case Text:
+			x, ok := v.(string)
+			if !ok {
+				return nil, typeError(a, v)
+			}
+			t = binary.LittleEndian.AppendUint32(t, uint32(len(x)))
+			t = append(t, x...)
+		default:
+			panic("tuple: unknown type " + a.Type.String())
+		}
+	}
+	return t, nil
 }
 
 // Deform decodes t according to d. Returned values do not alias t.
@@ -133,25 +236,72 @@ func Form(d *Desc, values []Datum, nulls []bool) (Tuple, error) {
 // runs past len(t).
 // PostgreSQL: heap_deform_tuple in heaptuple.c.
 func Deform(d *Desc, t Tuple) (values []Datum, nulls []bool, err error) {
-	panic("not implemented")
+	if len(t) < FixedHeaderSize {
+		return nil, nil, fmt.Errorf("%w: %d-byte tuple", ErrCorrupt, len(t))
+	}
+	natts := t.Natts()
+	if natts > d.Len() {
+		return nil, nil, fmt.Errorf("%w: tuple has %d attributes, descriptor %d", ErrCorrupt, natts, d.Len())
+	}
+	hoff := t.Hoff()
+	if hoff > len(t) {
+		return nil, nil, fmt.Errorf("%w: hoff %d past end", ErrCorrupt, hoff)
+	}
+	values = make([]Datum, d.Len())
+	nulls = make([]bool, d.Len())
+	pos := hoff
+	for i, a := range d.Attrs {
+		if i >= natts || t.IsNull(i) {
+			nulls[i] = true
+			continue
+		}
+		pos = alignTo(pos, a.Type.Align())
+		size := a.Type.Size()
+		if size < 0 {
+			if pos+4 > len(t) {
+				return nil, nil, fmt.Errorf("%w: attribute %d length past end", ErrCorrupt, i)
+			}
+			size = 4 + int(binary.LittleEndian.Uint32(t[pos:]))
+		}
+		if pos+size > len(t) {
+			return nil, nil, fmt.Errorf("%w: attribute %d data past end", ErrCorrupt, i)
+		}
+		b := t[pos : pos+size]
+		switch a.Type {
+		case Int4:
+			values[i] = int32(binary.LittleEndian.Uint32(b))
+		case Int8:
+			values[i] = int64(binary.LittleEndian.Uint64(b))
+		case Bool:
+			values[i] = b[0] != 0
+		case Text:
+			values[i] = string(b[4:])
+		}
+		pos += size
+	}
+	return values, nulls, nil
 }
 
 // Natts returns the number of attributes stored in the tuple.
 // PostgreSQL: HeapTupleHeaderGetNatts in htup_details.h.
 func (t Tuple) Natts() int {
-	panic("not implemented")
+	return int(binary.LittleEndian.Uint16(t[offInfomask2:]) & nattsMask)
 }
 
 // Hoff returns the offset of column data.
-func (t Tuple) Hoff() int {
-	panic("not implemented")
-}
+func (t Tuple) Hoff() int { return int(t[offHoff]) }
 
 // IsNull reports whether attribute i (0-based) is NULL. True for
 // i >= Natts(); false for every i when HasNull is clear.
 // PostgreSQL: heap_attisnull in heaptuple.c.
 func (t Tuple) IsNull(i int) bool {
-	panic("not implemented")
+	if i >= t.Natts() {
+		return true
+	}
+	if t.Infomask()&HasNull == 0 {
+		return false
+	}
+	return t[FixedHeaderSize+i>>3]&(1<<(i&7)) == 0
 }
 
 // Xmin, Xmax, Ctid, and Infomask read header fields in place; the Set
@@ -159,11 +309,22 @@ func (t Tuple) IsNull(i int) bool {
 // bits into Infomask() rather than replacing it, or HasNull is lost.
 // PostgreSQL: HeapTupleHeaderGetXmin and the other HeapTupleHeaderGet/Set
 // macros in htup_details.h.
-func (t Tuple) Xmin() XID            { panic("not implemented") }
-func (t Tuple) SetXmin(x XID)        { panic("not implemented") }
-func (t Tuple) Xmax() XID            { panic("not implemented") }
-func (t Tuple) SetXmax(x XID)        { panic("not implemented") }
-func (t Tuple) Ctid() TID            { panic("not implemented") }
-func (t Tuple) SetCtid(id TID)       { panic("not implemented") }
-func (t Tuple) Infomask() uint16     { panic("not implemented") }
-func (t Tuple) SetInfomask(m uint16) { panic("not implemented") }
+func (t Tuple) Xmin() XID     { return XID(binary.LittleEndian.Uint32(t[offXmin:])) }
+func (t Tuple) SetXmin(x XID) { binary.LittleEndian.PutUint32(t[offXmin:], uint32(x)) }
+func (t Tuple) Xmax() XID     { return XID(binary.LittleEndian.Uint32(t[offXmax:])) }
+func (t Tuple) SetXmax(x XID) { binary.LittleEndian.PutUint32(t[offXmax:], uint32(x)) }
+
+func (t Tuple) Ctid() TID {
+	return TID{
+		Block: BlockNumber(binary.LittleEndian.Uint32(t[offCtid:])),
+		Off:   page.OffsetNumber(binary.LittleEndian.Uint16(t[offCtid+4:])),
+	}
+}
+
+func (t Tuple) SetCtid(id TID) {
+	binary.LittleEndian.PutUint32(t[offCtid:], uint32(id.Block))
+	binary.LittleEndian.PutUint16(t[offCtid+4:], uint16(id.Off))
+}
+
+func (t Tuple) Infomask() uint16     { return binary.LittleEndian.Uint16(t[offInfomask:]) }
+func (t Tuple) SetInfomask(m uint16) { binary.LittleEndian.PutUint16(t[offInfomask:], m) }
