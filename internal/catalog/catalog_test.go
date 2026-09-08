@@ -1111,3 +1111,80 @@ func TestIndexCache(t *testing.T) {
 		t.Fatalf("Indexes after DropIndex = %v", got)
 	}
 }
+
+// Statistics (chapter 14).
+
+func TestUpdateStats(t *testing.T) {
+	c, dir := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := createIndex(t, c, "users_pkey", oid, 0, true, true, 10)
+	if _, err := c.CreateTable("orders", ordersDesc, 10); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := c.Lookup("users")
+	if info.Pages != 0 || info.Tuples != 0 || info.Indexes[0].Pages != 0 || info.Indexes[0].Tuples != 0 {
+		t.Fatalf("fresh statistics: %+v %+v", info, info.Indexes[0])
+	}
+
+	if err := c.UpdateStats(oid, 3, 250, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.UpdateStats(idx.OID, 2, 250, 20); err != nil {
+		t.Fatal(err)
+	}
+	// The cache was invalidated and the new values are visible through
+	// every lookup path.
+	info, _ = c.Lookup("users")
+	if info.Pages != 3 || info.Tuples != 250 {
+		t.Errorf("Lookup after UpdateStats: pages %d tuples %d", info.Pages, info.Tuples)
+	}
+	if got := info.Indexes[0]; got.Pages != 2 || got.Tuples != 250 {
+		t.Errorf("index statistics: %+v", got)
+	}
+	if byIdx, _ := c.LookupIndex("users_pkey"); byIdx.Pages != 2 {
+		t.Errorf("LookupIndex statistics: %+v", byIdx)
+	}
+	if rel, _ := c.LookupOID(idx.OID); rel.Pages != 2 || rel.Tuples != 250 {
+		t.Errorf("index relation statistics: %+v", rel)
+	}
+
+	// The pg_class row is updated in place (a new version at the end,
+	// the old one stamped with xid); nothing else changes.
+	want := [][]tuple.Datum{
+		classRow(ClassOID, "pg_class"),
+		classRow(AttributeOID, "pg_attribute"),
+		classRow(IndexOID, "pg_index"),
+		classRow(oid+2, "orders"),
+		{int32(oid), "users", "r", int32(3), int64(250)},
+		{int32(idx.OID), "users_pkey", "i", int32(2), int64(250)},
+	}
+	if got := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(got, want) {
+		t.Errorf("pg_class rows\n got %v\nwant %v", got, want)
+	}
+	old, err := heap.Open(c.Pool(), ClassOID, ClassDesc).Fetch(tuple.TID{Block: 0, Off: 4})
+	if err != nil || old.Xmax() != 20 {
+		t.Errorf("old users row: xmax %d, err %v", old.Xmax(), err)
+	}
+	if err := c.UpdateStats(oid+50, 1, 1, 20); !errors.Is(err, ErrNotFound) {
+		t.Errorf("UpdateStats(unknown) = %v, want ErrNotFound", err)
+	}
+
+	// Statistics survive a restart, and a later update replaces them.
+	c = reopen(t, c, dir)
+	if info, _ := c.Lookup("users"); info.Pages != 3 || info.Tuples != 250 {
+		t.Errorf("after reopen: %+v", info)
+	}
+	if err := c.UpdateStats(oid, 4, 300, 21); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := c.Lookup("users"); info.Pages != 4 || info.Tuples != 300 {
+		t.Errorf("after second update: %+v", info)
+	}
+	infos, _ := c.Tables()
+	if got := names(infos); !reflect.DeepEqual(got, []string{"orders", "pg_attribute", "pg_class", "pg_index", "users", "users_pkey"}) {
+		t.Errorf("Tables = %v", got)
+	}
+}

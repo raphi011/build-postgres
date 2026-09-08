@@ -300,6 +300,16 @@ Explain
 	{"explain delete from t", `
 Explain
   Delete t (16384)`},
+	{"explain (costs off) select 1", `
+Explain (COSTS OFF)
+  Select
+    Target: ?column? int4 := 1`},
+	{"analyze t", `
+Analyze t (16384)`},
+	{"analyze t_pkey", `
+Analyze t_pkey (16386)`},
+	{"analyze", `
+Analyze`},
 }
 
 func TestGolden(t *testing.T) {
@@ -493,6 +503,7 @@ func TestErrors(t *testing.T) {
 		{"create index i on nope (a)", ErrUndefinedTable, `relation "nope" does not exist`, 0},
 		{"create index i on t_pkey (a)", ErrWrongObjectType, `"t_pkey" is an index`, 0},
 		{"create index i on t (nope)", ErrUndefinedColumn, `column "nope" does not exist`, 0},
+		{"analyze nope", ErrUndefinedTable, `relation "nope" does not exist`, 0},
 
 		// An index is not a table.
 		{"select * from t_pkey", ErrWrongObjectType, `"t_pkey" is an index`, 15},
@@ -572,6 +583,7 @@ func TestStmtKinds(t *testing.T) {
 		{"drop table t", &query.DropTable{}},
 		{"create index i on t (a)", &query.CreateIndex{}},
 		{"drop index i", &query.DropIndex{}},
+		{"analyze t", &query.Analyze{}},
 		{"begin", &query.Begin{}},
 		{"commit", &query.Commit{}},
 		{"rollback", &query.Rollback{}},
@@ -607,6 +619,8 @@ func typeName(v any) string {
 		return "CreateIndex"
 	case *query.DropIndex:
 		return "DropIndex"
+	case *query.Analyze:
+		return "Analyze"
 	case *query.Begin:
 		return "Begin"
 	case *query.Commit:

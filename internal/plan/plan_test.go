@@ -119,3 +119,74 @@ func TestModifyOpString(t *testing.T) {
 		}
 	}
 }
+
+// Chapter 14: estimates.
+
+func TestEstimateString(t *testing.T) {
+	cases := []struct {
+		est  Estimate
+		want string
+	}{
+		{Estimate{}, "cost=0.00..0.00 rows=0 width=0"},
+		{Estimate{StartupCost: 0.15, TotalCost: 8.17, Rows: 1, Width: 36}, "cost=0.15..8.17 rows=1 width=36"},
+		{Estimate{TotalCost: 22.0125, Rows: 1201, Width: 36}, "cost=0.00..22.01 rows=1201 width=36"},
+		{Estimate{StartupCost: 14304.815, TotalCost: 14554.8, Rows: 100000, Width: 4}, "cost=14304.82..14554.80 rows=100000 width=4"},
+	}
+	for _, c := range cases {
+		if got := c.est.String(); got != c.want {
+			t.Errorf("%+v.String() = %q, want %q", c.est, got, c.want)
+		}
+	}
+}
+
+func TestExplainCosts(t *testing.T) {
+	scan := &SeqScan{Rel: t0, Est: Estimate{TotalCost: 22.01, Rows: 1201, Width: 36}}
+	// A Filter and a Project lend their estimates to the scan's line.
+	filter := &Filter{Input: scan, Qual: aGt1, Est: Estimate{TotalCost: 25.01, Rows: 400, Width: 36}}
+	proj := &Project{Input: filter, Targets: []query.Target{{Name: "a", Expr: va}}, Est: Estimate{TotalCost: 25.01, Rows: 400, Width: 4}}
+	sort := &Sort{Input: proj, Keys: []query.SortKey{{Expr: vb}}, Est: Estimate{StartupCost: 42.3, TotalCost: 43.3, Rows: 400, Width: 4}}
+	lim := &Limit{Input: sort, Count: &query.Const{Typ: tuple.Int8, Value: int64(2)}, Est: Estimate{StartupCost: 42.3, TotalCost: 42.31, Rows: 2, Width: 4}}
+	cases := []struct {
+		name string
+		plan Node
+		want string
+	}{
+		{"scan", scan, "Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)"},
+		{"filter", filter, `
+Seq Scan on t  (cost=0.00..25.01 rows=400 width=36)
+  Filter: (t.a > 1)`},
+		{"project", proj, `
+Seq Scan on t  (cost=0.00..25.01 rows=400 width=4)
+  Filter: (t.a > 1)`},
+		{"tree", lim, `
+Limit  (cost=42.30..42.31 rows=2 width=4)
+  ->  Sort  (cost=42.30..43.30 rows=400 width=4)
+        Sort Key: t.b
+        ->  Seq Scan on t  (cost=0.00..25.01 rows=400 width=4)
+              Filter: (t.a > 1)`},
+		{"index scan", &IndexScan{Rel: tu, Index: iInfo, Quals: []query.Expr{aEq1}, Est: Estimate{StartupCost: 0.15, TotalCost: 8.17, Rows: 1, Width: 36}},
+			`
+Index Scan using i on t u  (cost=0.15..8.17 rows=1 width=36)
+  Index Cond: (t.a = 1)`},
+		{"result", &Project{Input: &Result{Est: Estimate{TotalCost: 0.01, Rows: 1, Width: 4}},
+			Targets: []query.Target{{Name: "?column?", Expr: one}}, Est: Estimate{TotalCost: 0.01, Rows: 1, Width: 4}},
+			"Result  (cost=0.00..0.01 rows=1 width=4)"},
+		{"insert", &ModifyTable{Op: Insert, Rel: t0, Input: &Values{Rows: [][]query.Expr{{one, vb}}, Est: Estimate{TotalCost: 0.0125, Rows: 1, Width: 36}}},
+			`
+Insert on t  (cost=0.00..0.00 rows=0 width=0)
+  ->  Values Scan on "*VALUES*"  (cost=0.00..0.01 rows=1 width=36)`},
+	}
+	for _, c := range cases {
+		got := strings.Join(ExplainCosts(c.plan), "\n")
+		if got != strings.TrimPrefix(c.want, "\n") {
+			t.Errorf("%s:\n%s\nwant\n%s", c.name, got, strings.TrimPrefix(c.want, "\n"))
+		}
+	}
+	// Explain stays cost-free, and a hand-built tree has zero estimates.
+	if got := strings.Join(Explain(lim), "\n"); strings.Contains(got, "cost=") {
+		t.Errorf("Explain prints costs:\n%s", got)
+	}
+	if (&SeqScan{Rel: t0}).Estimate() != (Estimate{}) {
+		t.Error("a fresh node has a non-zero estimate")
+	}
+}

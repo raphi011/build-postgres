@@ -81,7 +81,7 @@ type Token struct {
 // keywords is the set of reserved words, lower-cased. Later chapters add
 // to it.
 var keywords = map[string]bool{
-	"and": true, "as": true, "asc": true, "begin": true, "by": true,
+	"analyze": true, "and": true, "as": true, "asc": true, "begin": true, "by": true,
 	"commit": true, "create": true, "delete": true, "desc": true,
 	"drop": true, "explain": true, "false": true, "from": true,
 	"index": true, "insert": true, "into": true, "is": true, "join": true,
