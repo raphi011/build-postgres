@@ -1188,3 +1188,48 @@ func TestUpdateStats(t *testing.T) {
 		t.Errorf("Tables = %v", got)
 	}
 }
+
+// Chapter 16: the control file has two writers, the catalog for OIDs and
+// the transaction manager for XIDs; neither may lose the other's update.
+func TestUpdateControl(t *testing.T) {
+	dir := t.TempDir()
+	if err := UpdateControl(dir, func(c *Control) {}); !errors.Is(err, ErrNotBootstrapped) {
+		t.Fatalf("UpdateControl on empty dir: %v, want ErrNotBootstrapped", err)
+	}
+	start := Control{NextOID: FirstUserOID, NextXID: tuple.FirstNormalXID}
+	if err := WriteControl(dir, start); err != nil {
+		t.Fatal(err)
+	}
+	const workers, each = 8, 20
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				err := UpdateControl(dir, func(c *Control) {
+					if w%2 == 0 {
+						c.NextOID++
+					} else {
+						c.NextXID++
+					}
+				})
+				if err != nil {
+					t.Error(err)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	got, err := ReadControl(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Control{NextOID: start.NextOID + workers/2*each, NextXID: start.NextXID + workers/2*each}
+	if got != want {
+		t.Errorf("control after concurrent updates = %+v, want %+v", got, want)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "global", "control.tmp")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("control.tmp left behind: %v", err)
+	}
+}

@@ -15,11 +15,14 @@ import (
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
+	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/index"
+	"github.com/raphi011/build-postgres/internal/page"
 	"github.com/raphi011/build-postgres/internal/sql/analyzer"
 	"github.com/raphi011/build-postgres/internal/sql/lexer"
 	"github.com/raphi011/build-postgres/internal/sql/parser"
 	"github.com/raphi011/build-postgres/internal/tuple"
+	"github.com/raphi011/build-postgres/internal/txn"
 )
 
 func open(t *testing.T, dir string) *Session {
@@ -1002,4 +1005,312 @@ func TestJoinOracle(t *testing.T) {
 		t.Errorf("%s planned as %v", filtered, r.Rows)
 	}
 	check(filtered, func(tr, ur []tuple.Datum) bool { return eq(tr[0], ur[0]) && tr[1] == "s0" })
+}
+
+// Chapter 16: transactions.
+
+// header is the transaction stamp of one heap tuple.
+type header struct {
+	tid        tuple.TID
+	xmin, xmax tuple.XID
+}
+
+// headers returns the stamps of every tuple of table in TID order, dead
+// ones included.
+func headers(t *testing.T, s *Session, table string) []header {
+	t.Helper()
+	rel, err := s.cat.Lookup(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := heap.Open(s.pool, rel.OID, rel.Desc)
+	n, err := h.NBlocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []header
+	for blk := tuple.BlockNumber(0); blk < n; blk++ {
+		buf, err := s.pool.Pin(rel.OID, blk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := buf.Page()
+		for i := page.OffsetNumber(1); i <= p.NumItems(); i++ {
+			item, err := p.GetItem(i)
+			if err != nil {
+				continue
+			}
+			tup := tuple.Tuple(item)
+			out = append(out, header{tuple.TID{Block: blk, Off: i}, tup.Xmin(), tup.Xmax()})
+		}
+		s.pool.Unpin(buf)
+	}
+	return out
+}
+
+func txStatus(t *testing.T, s *Session, xid tuple.XID) txn.Status {
+	t.Helper()
+	st, err := s.txn.Status(xid)
+	if err != nil {
+		t.Fatalf("Status(%d): %v", xid, err)
+	}
+	return st
+}
+
+func TestImplicitTransactions(t *testing.T) {
+	s := newSession(t)
+	first := s.txn.NextXID()
+	if first != tuple.FirstNormalXID {
+		t.Fatalf("first XID after bootstrap = %d, want %d", first, tuple.FirstNormalXID)
+	}
+	// Every statement gets its own XID, including a failed one and DDL.
+	exec(t, s, "create table t (a int4)")                           // first
+	exec(t, s, "insert into t values (1)")                          // first+1
+	exec(t, s, "insert into t values (2)")                          // first+2
+	if _, err := s.Exec("insert into t values (1/0)"); err == nil { // first+3
+		t.Fatal("division by zero did not fail")
+	}
+	exec(t, s, "delete from t where a = 1")      // first+4
+	exec(t, s, "update t set a = 3 where a = 2") // first+5
+	exec(t, s, "select * from t")                // first+6
+	if s.tx != nil || s.explicit || s.failed {
+		t.Errorf("transaction state after statements: tx %v explicit %v failed %v", s.tx, s.explicit, s.failed)
+	}
+	if got := s.txn.NextXID(); got != first+7 {
+		t.Errorf("NextXID = %d, want %d", got, first+7)
+	}
+	want := []header{
+		{tuple.TID{Block: 0, Off: 1}, first + 1, first + 4},
+		{tuple.TID{Block: 0, Off: 2}, first + 2, first + 5},
+		{tuple.TID{Block: 0, Off: 3}, first + 5, 0},
+	}
+	if got := headers(t, s, "t"); !reflect.DeepEqual(got, want) {
+		t.Errorf("headers of t:\n got %+v\nwant %+v", got, want)
+	}
+	classes := headers(t, s, "pg_class")
+	if last := classes[len(classes)-1]; last.xmin != first || last.xmax != 0 {
+		t.Errorf("pg_class row of t stamped %+v, want xmin %d", last, first)
+	}
+	for i, want := range []txn.Status{
+		txn.Committed, txn.Committed, txn.Committed, txn.Aborted,
+		txn.Committed, txn.Committed, txn.Committed,
+	} {
+		if got := txStatus(t, s, first+tuple.XID(i)); got != want {
+			t.Errorf("Status(%d) = %v, want %v", first+tuple.XID(i), got, want)
+		}
+	}
+
+	// In a multi-statement string each statement is still its own
+	// transaction: the first commits before the second fails.
+	res, err := s.Exec("insert into t values (4); select 1/0; insert into t values (5)")
+	if err == nil || len(res) != 1 {
+		t.Fatalf("results before error = %d, err %v", len(res), err)
+	}
+	if got := txStatus(t, s, first+7); got != txn.Committed {
+		t.Errorf("first statement of the string: %v, want committed", got)
+	}
+	if got := txStatus(t, s, first+8); got != txn.Aborted {
+		t.Errorf("failing statement of the string: %v, want aborted", got)
+	}
+	if got := s.txn.NextXID(); got != first+9 {
+		t.Errorf("NextXID = %d, want %d", got, first+9)
+	}
+}
+
+func TestTransactionBlock(t *testing.T) {
+	s := newSession(t)
+	exec(t, s, "create table t (a int4 primary key)")
+
+	r := exec(t, s, "begin")
+	if r.Tag != "BEGIN" || r.Warnings != nil {
+		t.Fatalf("BEGIN: %+v", r)
+	}
+	if s.tx == nil || !s.explicit {
+		t.Fatal("BEGIN did not open a block")
+	}
+	xid := s.tx.XID
+	exec(t, s, "insert into t values (1)")
+	exec(t, s, "insert into t values (2)")
+	if got := s.txn.NextXID(); got != xid+1 {
+		t.Errorf("statements in a block allocated XIDs: NextXID = %d, want %d", got, xid+1)
+	}
+	if got := txStatus(t, s, xid); got != txn.InProgress {
+		t.Errorf("Status before COMMIT = %v", got)
+	}
+	r = exec(t, s, "commit")
+	if r.Tag != "COMMIT" || r.Warnings != nil {
+		t.Errorf("COMMIT: %+v", r)
+	}
+	if s.tx != nil || s.explicit {
+		t.Error("COMMIT left the block open")
+	}
+	if got := txStatus(t, s, xid); got != txn.Committed {
+		t.Errorf("Status after COMMIT = %v", got)
+	}
+
+	exec(t, s, "begin")
+	rolled := s.tx.XID
+	exec(t, s, "insert into t values (3)")
+	exec(t, s, "delete from t where a = 1")
+	r = exec(t, s, "rollback")
+	if r.Tag != "ROLLBACK" || r.Warnings != nil {
+		t.Errorf("ROLLBACK: %+v", r)
+	}
+	if s.tx != nil || s.explicit {
+		t.Error("ROLLBACK left the block open")
+	}
+	if got := txStatus(t, s, rolled); got != txn.Aborted {
+		t.Errorf("Status after ROLLBACK = %v", got)
+	}
+	// The tuples carry the rolled-back XID; chapter 17 makes them
+	// invisible by looking it up.
+	want := []header{
+		{tuple.TID{Block: 0, Off: 1}, xid, rolled},
+		{tuple.TID{Block: 0, Off: 2}, xid, 0},
+		{tuple.TID{Block: 0, Off: 3}, rolled, 0},
+	}
+	if got := headers(t, s, "t"); !reflect.DeepEqual(got, want) {
+		t.Errorf("headers of t:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestTransactionWarnings(t *testing.T) {
+	s := newSession(t)
+	next := s.txn.NextXID()
+	for _, tc := range []struct{ sql, tag, warning string }{
+		{"commit", "COMMIT", WarnNoTransaction},
+		{"rollback", "ROLLBACK", WarnNoTransaction},
+	} {
+		r := exec(t, s, tc.sql)
+		if r.Tag != tc.tag || !reflect.DeepEqual(r.Warnings, []string{tc.warning}) {
+			t.Errorf("%s outside a block: %+v", tc.sql, r)
+		}
+		if s.tx != nil || s.explicit {
+			t.Errorf("%s outside a block changed the state", tc.sql)
+		}
+	}
+	if got := s.txn.NextXID(); got != next {
+		t.Errorf("COMMIT and ROLLBACK outside a block allocated XIDs: %d, want %d", got, next)
+	}
+
+	exec(t, s, "begin")
+	xid := s.tx.XID
+	r := exec(t, s, "begin")
+	if r.Tag != "BEGIN" || !reflect.DeepEqual(r.Warnings, []string{WarnAlreadyTransaction}) {
+		t.Errorf("BEGIN inside a block: %+v", r)
+	}
+	if s.tx == nil || s.tx.XID != xid {
+		t.Error("second BEGIN replaced the transaction")
+	}
+	r = exec(t, s, "commit")
+	if r.Tag != "COMMIT" || r.Warnings != nil {
+		t.Errorf("COMMIT after nested BEGIN: %+v", r)
+	}
+	if got := txStatus(t, s, xid); got != txn.Committed {
+		t.Errorf("Status = %v", got)
+	}
+}
+
+func TestFailedTransaction(t *testing.T) {
+	const msg = "current transaction is aborted, commands ignored until end of transaction block"
+	s := newSession(t)
+	exec(t, s, "create table t (a int4 not null)")
+	for _, end := range []string{"commit", "rollback"} {
+		exec(t, s, "begin")
+		xid := s.tx.XID
+		exec(t, s, "insert into t values (1)")
+		if _, err := s.Exec("insert into t values (null)"); !errors.Is(err, analyzer.ErrNotNull) {
+			t.Fatalf("NOT NULL violation: %v", err)
+		}
+		// The transaction is aborted at once; the block stays open.
+		if got := txStatus(t, s, xid); got != txn.Aborted {
+			t.Errorf("Status after the error = %v, want aborted", got)
+		}
+		if s.tx == nil || !s.explicit || !s.failed {
+			t.Errorf("state after the error: tx %v explicit %v failed %v", s.tx, s.explicit, s.failed)
+		}
+		for _, sql := range []string{
+			"select 1",
+			"insert into t values (2)",
+			"select * from nope",
+			"create table u (a int4)",
+			"begin",
+		} {
+			_, err := s.Exec(sql)
+			var e *Error
+			if !errors.Is(err, ErrInFailedTransaction) || !errors.As(err, &e) {
+				t.Errorf("%s in a failed block: %v", sql, err)
+				continue
+			}
+			if e.Msg != msg || e.Pos.Line != 0 {
+				t.Errorf("%s in a failed block: msg %q pos %+v", sql, e.Msg, e.Pos)
+			}
+		}
+		// Parsing happens first, so a syntax error is still one.
+		if _, err := s.Exec("selec 1"); !errors.Is(err, parser.ErrSyntax) {
+			t.Errorf("syntax error in a failed block: %v", err)
+		}
+		if got := s.txn.NextXID(); got != xid+1 {
+			t.Errorf("refused statements allocated XIDs: NextXID = %d, want %d", got, xid+1)
+		}
+
+		// Either way out of the block reports ROLLBACK, and the next
+		// statement runs normally.
+		r := exec(t, s, end)
+		if r.Tag != "ROLLBACK" || r.Warnings != nil {
+			t.Errorf("%s of a failed block: %+v", end, r)
+		}
+		if s.tx != nil || s.explicit || s.failed {
+			t.Errorf("state after %s: tx %v explicit %v failed %v", end, s.tx, s.explicit, s.failed)
+		}
+		if r := exec(t, s, "select 1"); r.Rows[0][0] != int32(1) {
+			t.Errorf("after %s: %v", end, r.Rows)
+		}
+	}
+	// A failed statement outside a block ends its own transaction; the
+	// next statement runs.
+	if _, err := s.Exec("insert into t values (null)"); err == nil {
+		t.Fatal("NOT NULL violation did not fail")
+	}
+	exec(t, s, "select 1")
+}
+
+func TestTransactionPersistence(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(t, s, "create table t (a int4)")
+	exec(t, s, "begin")
+	committed := s.tx.XID
+	exec(t, s, "insert into t values (1)")
+	exec(t, s, "commit")
+	exec(t, s, "begin")
+	open1 := s.tx.XID
+	exec(t, s, "insert into t values (2)")
+	// Close aborts the open transaction.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s = open(t, dir)
+	if got := txStatus(t, s, committed); got != txn.Committed {
+		t.Errorf("committed transaction after reopen: %v", got)
+	}
+	if got := txStatus(t, s, open1); got != txn.Aborted {
+		t.Errorf("transaction open at Close after reopen: %v, want aborted", got)
+	}
+	exec(t, s, "begin")
+	if s.tx.XID != open1+1 {
+		t.Errorf("first XID after reopen = %d, want %d", s.tx.XID, open1+1)
+	}
+	exec(t, s, "rollback")
+	want := []header{
+		{tuple.TID{Block: 0, Off: 1}, committed, 0},
+		{tuple.TID{Block: 0, Off: 2}, open1, 0},
+	}
+	if got := headers(t, s, "t"); !reflect.DeepEqual(got, want) {
+		t.Errorf("headers of t:\n got %+v\nwant %+v", got, want)
+	}
 }

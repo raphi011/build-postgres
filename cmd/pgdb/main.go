@@ -131,6 +131,9 @@ func repl(s *session.Session, in io.Reader, out, errOut io.Writer, interactive b
 func exec(s *session.Session, stmt string, out, errOut io.Writer) {
 	results, err := s.Exec(stmt)
 	for _, r := range results {
+		for _, w := range r.Warnings {
+			fmt.Fprintln(errOut, "WARNING: ", w)
+		}
 		if r.Columns != nil {
 			fmt.Fprint(out, r)
 		} else {

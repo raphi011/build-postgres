@@ -51,10 +51,11 @@ recovery, aggregates, the PostgreSQL wire protocol so real `psql` connects.
 
 ## Status
 
-Parts 1 to 5 (chapters 00–15: storage, SQL front end, expression
-evaluation, executor, a working REPL with the SQL regression suite, the
-on-disk B-tree, `CREATE INDEX` with `PRIMARY KEY`, unique indexes, and
-an index scan node, `ANALYZE`, the cost model, and `EXPLAIN` with
-costs, and nested loop and hash joins with a cost-based join order) are
-written on `main` with a reference implementation on `solution`.
-Chapter 16 (transactions) is next.
+Parts 1 to 5 and chapter 16 (chapters 00–16: storage, SQL front end,
+expression evaluation, executor, a working REPL with the SQL regression
+suite, the on-disk B-tree, `CREATE INDEX` with `PRIMARY KEY`, unique
+indexes, and an index scan node, `ANALYZE`, the cost model, and
+`EXPLAIN` with costs, nested loop and hash joins with a cost-based join
+order, and transaction IDs with the commit log, `BEGIN`, `COMMIT`, and
+`ROLLBACK`) are written on `main` with a reference implementation on
+`solution`. Chapter 17 (MVCC) is next.

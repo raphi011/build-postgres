@@ -1,0 +1,82 @@
+-- Transaction blocks.
+CREATE TABLE t (a int4 PRIMARY KEY, b text);
+BEGIN;
+INSERT INTO t VALUES (1, 'one');
+INSERT INTO t VALUES (2, 'two');
+COMMIT;
+SELECT * FROM t ORDER BY a;
+ a |  b  
+---+-----
+ 1 | one
+ 2 | two
+(2 rows)
+
+-- COMMIT and ROLLBACK outside a block, and BEGIN inside one, only warn.
+COMMIT;
+WARNING:  there is no transaction in progress
+ROLLBACK;
+WARNING:  there is no transaction in progress
+BEGIN;
+BEGIN;
+WARNING:  there is already a transaction in progress
+INSERT INTO t VALUES (3, 'three');
+COMMIT;
+SELECT * FROM t ORDER BY a;
+ a |   b   
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+(3 rows)
+
+BEGIN;
+SELECT * FROM t WHERE a = 3;
+ a |   b   
+---+-------
+ 3 | three
+(1 row)
+
+ROLLBACK;
+-- An error aborts the block: everything but COMMIT and ROLLBACK is
+-- refused until the block ends, syntax errors excepted, and COMMIT
+-- rolls back.
+BEGIN;
+SELECT 1 / 0;
+ERROR:  division by zero
+INSERT INTO t VALUES (4, 'four');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+SELECT * FROM t;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+CREATE TABLE u (a int4);
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+BEGIN;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+SELEC 1;
+ERROR:  syntax error at or near "SELEC"
+LINE 1: SELEC 1;
+        ^
+COMMIT;
+SELECT * FROM t ORDER BY a;
+ a |   b   
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+(3 rows)
+
+BEGIN;
+INSERT INTO t VALUES (1, 'dup');
+ERROR:  duplicate key value violates unique constraint "t_pkey"
+INSERT INTO t VALUES (4, 'four');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK;
+SELECT * FROM t ORDER BY a;
+ a |   b   
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+(3 rows)
+
+-- The chapter 17 rule makes rolled-back writes invisible; until then a
+-- SELECT after ROLLBACK of a write is not part of the regression suite.
