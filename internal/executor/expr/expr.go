@@ -34,13 +34,17 @@ type Row struct {
 }
 
 // Layout maps the columns of a range table onto row slots. Element i is
-// the slot of the first column of range entry i, and the final element
-// is the total number of slots, so a Layout has one more element than
-// the range table it was built from.
+// the slot of the first column of the range entry whose Index is i, -1
+// for an entry the row does not hold, and the final element is the
+// total number of slots, so a Layout has two more elements than the
+// highest Index it holds. A row built from the range table itself has
+// its entries in Index order; a join's output (chapter 15) holds the
+// outer relations' columns before the inner's, whatever their Index.
 type Layout []int
 
-// NewLayout lays out the columns of every range entry in order.
-// NewLayout(nil) is Layout{0}: no columns, width zero.
+// NewLayout lays out the columns of the given range entries in the
+// given order, at the positions their Index says. NewLayout(nil) is
+// Layout{0}: no columns, width zero.
 func NewLayout(rng []*query.RangeEntry) Layout {
 	panic("not implemented")
 }

@@ -13,7 +13,6 @@ SELECT x.a FROM t;
 SELECT t.a FROM t AS x;
 SELECT a FROM t, t;
 SELECT a FROM t, t AS u;
-SELECT t.a FROM t, t AS u;
 SELECT * FROM t WHERE b;
 SELECT a + b FROM t;
 SELECT b > 1 FROM t;

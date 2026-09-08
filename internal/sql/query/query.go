@@ -30,6 +30,9 @@ type Expr interface {
 
 // RangeEntry is one relation of a query's range table.
 type RangeEntry struct {
+	// Index is the entry's position in the range table, what a Var's Rel
+	// refers to (chapter 15: a join's output need not be in that order).
+	Index int
 	// Alias is the name the query refers to the relation by: the alias if
 	// one was given, else the table name.
 	Alias string

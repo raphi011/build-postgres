@@ -52,8 +52,6 @@ SELECT a FROM t, t AS u;
 ERROR:  column reference "a" is ambiguous
 LINE 1: SELECT a FROM t, t AS u;
                ^
-SELECT t.a FROM t, t AS u;
-ERROR:  joins are not supported until chapter 15
 SELECT * FROM t WHERE b;
 ERROR:  argument of WHERE must be type boolean, not type text
 LINE 1: SELECT * FROM t WHERE b;

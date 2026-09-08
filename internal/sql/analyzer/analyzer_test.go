@@ -634,3 +634,21 @@ func typeName(v any) string {
 }
 
 var _ ast.Stmt = (*ast.Select)(nil)
+
+// Chapter 15: every range entry knows its position, which is what Vars
+// refer to and what a join's row layout is keyed by.
+func TestRangeIndex(t *testing.T) {
+	q := mustAnalyze(t, "select 1 from t, u join t t2 on u.a = t2.a").(*query.Select)
+	if len(q.Range) != 3 {
+		t.Fatalf("%d range entries, want 3", len(q.Range))
+	}
+	for i, e := range q.Range {
+		if e.Index != i {
+			t.Errorf("Range[%d].Index = %d", i, e.Index)
+		}
+	}
+	v := q.Where.(*query.OpExpr).Right.(*query.Var)
+	if v.Rel != 2 || q.Range[v.Rel].Alias != "t2" {
+		t.Errorf("t2.a bound to Rel %d (%s)", v.Rel, q.Range[v.Rel].Alias)
+	}
+}
