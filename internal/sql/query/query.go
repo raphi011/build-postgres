@@ -111,9 +111,10 @@ type Commit struct{}
 // Rollback is ROLLBACK.
 type Rollback struct{}
 
-// Explain is EXPLAIN stmt.
+// Explain is EXPLAIN stmt. CostsOff is set by (COSTS OFF).
 type Explain struct {
-	Stmt Stmt
+	Stmt     Stmt
+	CostsOff bool
 }
 
 func (*Select) stmtNode()      {}
@@ -411,3 +412,13 @@ func (s *CreateIndex) String() string {
 }
 
 func (s *DropIndex) String() string { return "DropIndex " + ast.QuoteIdent(s.Name) }
+
+// Analyze is a bound ANALYZE. Rel is nil for the whole database.
+type Analyze struct {
+	Rel *catalog.RelationInfo
+}
+
+func (*Analyze) stmtNode() {}
+
+// Analyze dumps as "Analyze t (16384)", or "Analyze" for the database.
+func (s *Analyze) String() string { panic("not implemented") }

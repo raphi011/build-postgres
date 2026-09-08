@@ -3,8 +3,11 @@ package session
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -608,7 +611,7 @@ func TestIndexes(t *testing.T) {
 func TestExplain(t *testing.T) {
 	s := newSession(t)
 	exec(t, s, "create table t (a int4, b text)")
-	r := exec(t, s, "explain select a from t where a > 1 order by b limit 2")
+	r := exec(t, s, "explain (costs off) select a from t where a > 1 order by b limit 2")
 	if r.Tag != "EXPLAIN" || !reflect.DeepEqual(r.Columns, []Column{{"QUERY PLAN", tuple.Text}}) {
 		t.Errorf("explain result: %+v", r)
 	}
@@ -625,11 +628,149 @@ func TestExplain(t *testing.T) {
 		t.Errorf("explain =\n%s\nwant\n%s", got, want)
 	}
 	// EXPLAIN plans without running: the table stays empty.
-	exec(t, s, "explain insert into t values (1, 'x')")
+	exec(t, s, "explain (costs off) insert into t values (1, 'x')")
 	if r := exec(t, s, "select * from t"); len(r.Rows) != 0 {
 		t.Error("EXPLAIN INSERT inserted")
 	}
 	if _, err := s.Exec("explain select * from nope"); !errors.Is(err, analyzer.ErrUndefinedTable) {
 		t.Errorf("explain of bad query: %v", err)
+	}
+}
+
+// Chapter 14: statistics and costs.
+
+func TestExplainCosts(t *testing.T) {
+	s := newSession(t)
+	exec(t, s, "create table t (a int4 primary key, b text)")
+	// Never analysed: 10 pages assumed, and the index is chosen for an
+	// equality.
+	r := exec(t, s, "explain select * from t")
+	want := lines(`                      QUERY PLAN                      `,
+		`------------------------------------------------------`,
+		` Seq Scan on t  (cost=0.00..22.01 rows=1201 width=36)`,
+		`(1 row)`,
+		``)
+	if got := r.String(); got != want {
+		t.Errorf("explain =\n%s\nwant\n%s", got, want)
+	}
+	r = exec(t, s, "explain select b from t where a = 1")
+	want = lines(`                            QUERY PLAN                            `,
+		`------------------------------------------------------------------`,
+		` Index Scan using t_pkey on t  (cost=0.15..24.26 rows=6 width=32)`,
+		`   Index Cond: (t.a = 1)`,
+		`(2 rows)`,
+		``)
+	if got := r.String(); got != want {
+		t.Errorf("explain index =\n%s\nwant\n%s", got, want)
+	}
+	// After ANALYZE of a small table the sequential scan is cheaper.
+	exec(t, s, "insert into t values (1, 'x'), (2, 'y'), (3, 'z')")
+	exec(t, s, "analyze t")
+	r = exec(t, s, "explain select b from t where a = 1")
+	want = lines(`                    QUERY PLAN                    `,
+		`--------------------------------------------------`,
+		` Seq Scan on t  (cost=0.00..1.04 rows=1 width=32)`,
+		`   Filter: (t.a = 1)`,
+		`(2 rows)`,
+		``)
+	if got := r.String(); got != want {
+		t.Errorf("explain after analyze =\n%s\nwant\n%s", got, want)
+	}
+	if r := exec(t, s, "explain (costs off) select b from t where a = 1"); !reflect.DeepEqual(r.Rows, [][]tuple.Datum{{"Seq Scan on t"}, {"  Filter: (t.a = 1)"}}) {
+		t.Errorf("costs off: %v", r.Rows)
+	}
+}
+
+func TestAnalyze(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	s := open(t, dir)
+	exec(t, s, "create table t (a int4 primary key, b text)")
+	exec(t, s, "insert into t values (1, 'x'), (2, 'y'), (3, 'z')")
+	stats := func(name string) []tuple.Datum {
+		t.Helper()
+		r := exec(t, s, "select relpages, reltuples from pg_class where relname = '"+name+"'")
+		if len(r.Rows) != 1 {
+			t.Fatalf("pg_class rows for %s: %v", name, r.Rows)
+		}
+		return r.Rows[0]
+	}
+	if got := stats("t"); !reflect.DeepEqual(got, []tuple.Datum{int32(0), int64(0)}) {
+		t.Errorf("before analyze: %v", got)
+	}
+	if r := exec(t, s, "analyze t"); r.Tag != "ANALYZE" || r.Columns != nil {
+		t.Errorf("analyze: %+v", r)
+	}
+	// The table's pages and live tuples, and the index's pages (metapage
+	// plus one leaf) with the same tuple count.
+	if got := stats("t"); !reflect.DeepEqual(got, []tuple.Datum{int32(1), int64(3)}) {
+		t.Errorf("after analyze: %v", got)
+	}
+	if got := stats("t_pkey"); !reflect.DeepEqual(got, []tuple.Datum{int32(2), int64(3)}) {
+		t.Errorf("index after analyze: %v", got)
+	}
+	// Deleted tuples are not counted; the counts follow the data.
+	exec(t, s, "delete from t where a = 2")
+	exec(t, s, "insert into t values (4, 'w'), (5, 'v')")
+	exec(t, s, "analyze t")
+	if got := stats("t"); !reflect.DeepEqual(got, []tuple.Datum{int32(1), int64(4)}) {
+		t.Errorf("after delete and insert: %v", got)
+	}
+	// ANALYZE of an index is skipped silently, as PostgreSQL does with a
+	// warning; an unknown relation is an error; ANALYZE alone does every
+	// table, the catalogs included.
+	if r := exec(t, s, "analyze t_pkey"); r.Tag != "ANALYZE" {
+		t.Errorf("analyze index: %+v", r)
+	}
+	if _, err := s.Exec("analyze nope"); !errors.Is(err, analyzer.ErrUndefinedTable) {
+		t.Errorf("analyze nope: %v", err)
+	}
+	if r := exec(t, s, "analyze"); r.Tag != "ANALYZE" {
+		t.Errorf("analyze all: %+v", r)
+	}
+	if got := stats("pg_class"); got[0] != int32(1) || got[1].(int64) < 5 {
+		t.Errorf("pg_class after analyze: %v", got)
+	}
+	// Statistics persist.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open(t, dir)
+	if got := stats("t"); !reflect.DeepEqual(got, []tuple.Datum{int32(1), int64(4)}) {
+		t.Errorf("after reopen: %v", got)
+	}
+}
+
+// TestPlansAgree: whichever scan the planner picks, the rows are the
+// same. Random rows with duplicates and NULLs; every predicate is run
+// once as written, where the index is eligible, and once as a + 0, which
+// forces a sequential scan.
+func TestPlansAgree(t *testing.T) {
+	s := newSession(t)
+	exec(t, s, "create table t (a int4, b text)")
+	exec(t, s, "create index t_a on t (a)")
+	rng := rand.New(rand.NewSource(7))
+	var values []string
+	for i := 0; i < 300; i++ {
+		a := "null"
+		if rng.Intn(10) > 0 {
+			a = strconv.Itoa(rng.Intn(50))
+		}
+		values = append(values, fmt.Sprintf("(%s, 'r%d')", a, i))
+	}
+	exec(t, s, "insert into t values "+strings.Join(values, ", "))
+	for _, pred := range []string{"a = 7", "a > 40", "a >= 10 and a < 15", "a < 3 or a > 47", "a = 7 and b is not null", "1 < a and a <= 2"} {
+		indexed := exec(t, s, "select * from t where "+pred+" order by b")
+		seq := exec(t, s, "select * from t where "+regexp.MustCompile(`\ba\b`).ReplaceAllString(pred, "(a + 0)")+" order by b")
+		if !reflect.DeepEqual(indexed.Rows, seq.Rows) {
+			t.Errorf("%s: %d rows through the planner's choice, %d through a sequential scan", pred, len(indexed.Rows), len(seq.Rows))
+		}
+		if len(indexed.Rows) == 0 {
+			t.Errorf("%s matched nothing; weak test", pred)
+		}
+	}
+	// The equality really is planned as an index scan.
+	r := exec(t, s, "explain (costs off) select * from t where a = 7")
+	if len(r.Rows) == 0 || r.Rows[0][0] != "Index Scan using t_a on t" {
+		t.Errorf("a = 7 planned as %v", r.Rows)
 	}
 }

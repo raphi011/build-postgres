@@ -175,3 +175,19 @@ there too (`index.Check`), so that `index.Insert` cannot fail after the
 heap write. Index scans exist as an executor node from this chapter; the
 planner keeps choosing sequential scans until chapter 14 has statistics
 to choose with.
+
+## D21: A cost model with default selectivities and no column statistics
+
+The planner uses PostgreSQL's cost parameters and formulas (`cost_seqscan`,
+`cost_index` with Mackert-Lohman page fetches, `cost_sort`, the LIMIT
+fraction), fed by `relpages` and `reltuples` that `ANALYZE` records, but
+no per-column statistics: every predicate takes the default selectivity
+PostgreSQL uses without a histogram (`0.005` for `=`, `1/3` for one
+inequality, `0.005` for a range). Histograms and most-common-value lists
+would add a sampling pass and a `pg_statistic` catalog for one more
+input to the same formulas; the defaults already make the planner switch
+between index and sequential scans as a table grows, which is the effect
+the chapter is about. Two consequences are visible in `EXPLAIN`: row
+estimates are the same for every value, and small analysed tables scan
+sequentially even for an equality on an indexed column, since a fetch of
+0.5 percent of the rows costs more than reading one page.

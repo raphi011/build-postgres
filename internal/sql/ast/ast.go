@@ -137,9 +137,11 @@ type Commit struct{}
 // Rollback is ROLLBACK.
 type Rollback struct{}
 
-// Explain is EXPLAIN stmt; Stmt is a Select, Insert, Update, or Delete.
+// Explain is EXPLAIN [(COSTS OFF)] stmt; Stmt is a Select, Insert,
+// Update, or Delete. CostsOff is set by (COSTS OFF).
 type Explain struct {
-	Stmt Stmt
+	Stmt     Stmt
+	CostsOff bool
 }
 
 func (*CreateTable) stmtNode() {}
@@ -543,3 +545,12 @@ func (s *CreateIndex) String() string {
 func (s *DropIndex) String() string {
 	return "DROP INDEX " + QuoteIdent(s.Name)
 }
+
+// Analyze is ANALYZE [table]. Table is "" for the whole database.
+type Analyze struct {
+	Table string
+}
+
+func (*Analyze) stmtNode() {}
+
+func (s *Analyze) String() string { panic("not implemented") }

@@ -97,9 +97,9 @@ type RelationInfo struct {
 	Indexes []*IndexInfo // primary key first, then by name
 }
 
-// IndexInfo is a pg_index row joined with the index relation's name:
-// the index's own OID, the indexed table's OID, and the key column as a
-// 0-based attribute number.
+// IndexInfo is a pg_index row joined with the index relation's pg_class
+// row: the index's own OID, name, and statistics, the indexed table's
+// OID, and the key column as a 0-based attribute number.
 type IndexInfo struct {
 	OID     tuple.OID
 	Name    string
@@ -107,6 +107,8 @@ type IndexInfo struct {
 	Attr    int
 	Unique  bool
 	Primary bool
+	Pages   int32
+	Tuples  int64
 }
 
 // Control is the content of <datadir>/global/control.
@@ -764,4 +766,12 @@ func (c *Catalog) loadIndexes(info *RelationInfo) error {
 	})
 	info.Indexes = idxs
 	return nil
+}
+
+// UpdateStats records the page and tuple counts of a relation (a table
+// or an index) in its pg_class row, stamping the new row version with
+// xid. Returns ErrNotFound for an unknown OID. Does not flush.
+// PostgreSQL: vac_update_relstats in vacuum.c.
+func (c *Catalog) UpdateStats(oid tuple.OID, pages int32, tuples int64, xid tuple.XID) error {
+	panic("not implemented")
 }

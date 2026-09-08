@@ -54,6 +54,6 @@ recovery, aggregates, the PostgreSQL wire protocol so real `psql` connects.
 Parts 1 to 4 (chapters 00–13: storage, SQL front end, expression
 evaluation, executor, a working REPL with the SQL regression suite, the
 on-disk B-tree, and `CREATE INDEX` with `PRIMARY KEY`, unique indexes,
-and an index scan node) are written on `main` with a reference
-implementation on `solution`. Chapter 14 (planner and `EXPLAIN`) is
-next.
+and an index scan node) and chapter 14 (`ANALYZE`, the cost model, the
+scan choice, and `EXPLAIN` with costs) are written on `main` with a
+reference implementation on `solution`. Chapter 15 (joins) is next.

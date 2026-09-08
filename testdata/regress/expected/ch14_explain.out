@@ -1,0 +1,163 @@
+-- The planner chooses between a sequential and an index scan by cost.
+CREATE TABLE t (a int4 PRIMARY KEY, b text);
+CREATE INDEX t_b ON t (b);
+-- Never analysed: the table is assumed to have 10 pages, so an equality
+-- on an indexed column uses the index and a single inequality does not.
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE a = 1;
+          QUERY PLAN          
+------------------------------
+ Index Scan using t_pkey on t
+   Index Cond: (t.a = 1)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE a > 1;
+     QUERY PLAN      
+---------------------
+ Seq Scan on t
+   Filter: (t.a > 1)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE a > 1 AND a < 5;
+               QUERY PLAN                
+-----------------------------------------
+ Index Scan using t_pkey on t
+   Index Cond: ((t.a > 1) AND (t.a < 5))
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE b = 'x';
+        QUERY PLAN         
+---------------------------
+ Index Scan using t_b on t
+   Index Cond: (t.b = 'x')
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE 1 = a AND b = 'x';
+          QUERY PLAN          
+------------------------------
+ Index Scan using t_pkey on t
+   Index Cond: (t.a = 1)
+   Filter: (t.b = 'x')
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE b <> 'x';
+       QUERY PLAN       
+------------------------
+ Seq Scan on t
+   Filter: (t.b <> 'x')
+(2 rows)
+
+-- An index in ORDER BY order replaces the sort; a descending order cannot.
+EXPLAIN (COSTS OFF) SELECT a FROM t ORDER BY a;
+          QUERY PLAN          
+------------------------------
+ Index Scan using t_pkey on t
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT a FROM t ORDER BY a DESC;
+      QUERY PLAN      
+----------------------
+ Sort
+   Sort Key: t.a DESC
+   ->  Seq Scan on t
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT b FROM t WHERE a > 1 ORDER BY b LIMIT 1;
+           QUERY PLAN            
+---------------------------------
+ Limit
+   ->  Index Scan using t_b on t
+         Filter: (t.a > 1)
+(3 rows)
+
+EXPLAIN (COSTS OFF) UPDATE t SET b = 'y' WHERE a = 1;
+             QUERY PLAN             
+------------------------------------
+ Update on t
+   ->  Index Scan using t_pkey on t
+         Index Cond: (t.a = 1)
+(3 rows)
+
+EXPLAIN (COSTS OFF) DELETE FROM t WHERE a > 1;
+        QUERY PLAN         
+---------------------------
+ Delete on t
+   ->  Seq Scan on t
+         Filter: (t.a > 1)
+(3 rows)
+
+-- With costs.
+EXPLAIN SELECT * FROM t WHERE a = 1;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Index Scan using t_pkey on t  (cost=0.15..24.26 rows=6 width=36)
+   Index Cond: (t.a = 1)
+(2 rows)
+
+EXPLAIN SELECT a FROM t WHERE a > 1 ORDER BY b LIMIT 2;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Limit  (cost=0.15..0.48 rows=2 width=4)
+   ->  Index Scan using t_b on t  (cost=0.15..65.17 rows=400 width=4)
+         Filter: (t.a > 1)
+(3 rows)
+
+EXPLAIN SELECT 1;
+                QUERY PLAN                
+------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=4)
+(1 row)
+
+EXPLAIN INSERT INTO t VALUES (1, 'x'), (2, 'y');
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Insert on t  (cost=0.00..0.03 rows=0 width=0)
+   ->  Values Scan on "*VALUES*"  (cost=0.00..0.03 rows=2 width=36)
+(2 rows)
+
+-- After ANALYZE of a small table the sequential scan is cheaper.
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');
+ANALYZE t;
+EXPLAIN SELECT * FROM t WHERE a = 1;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Seq Scan on t  (cost=0.00..1.04 rows=1 width=36)
+   Filter: (t.a = 1)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM t WHERE a = 1;
+     QUERY PLAN      
+---------------------
+ Seq Scan on t
+   Filter: (t.a = 1)
+(2 rows)
+
+EXPLAIN (COSTS OFF) SELECT a FROM t ORDER BY a;
+     QUERY PLAN      
+---------------------
+ Sort
+   Sort Key: t.a
+   ->  Seq Scan on t
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT a FROM t ORDER BY a LIMIT 1;
+        QUERY PLAN         
+---------------------------
+ Limit
+   ->  Sort
+         Sort Key: t.a
+         ->  Seq Scan on t
+(4 rows)
+
+-- Whichever scan runs, the rows are the same.
+SELECT * FROM t WHERE a = 1;
+ a | b 
+---+---
+ 1 | x
+(1 row)
+
+SELECT * FROM t WHERE a + 0 = 1;
+ a | b 
+---+---
+ 1 | x
+(1 row)
+

@@ -1,0 +1,44 @@
+-- ANALYZE records page and tuple counts in pg_class.
+CREATE TABLE t (a int4 PRIMARY KEY, b text);
+INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');
+SELECT relname, relpages, reltuples FROM pg_class WHERE relname = 't';
+ relname | relpages | reltuples 
+---------+----------+-----------
+ t       |        0 |         0
+(1 row)
+
+ANALYZE t;
+SELECT relname, relpages, reltuples FROM pg_class WHERE relname = 't';
+ relname | relpages | reltuples 
+---------+----------+-----------
+ t       |        1 |         3
+(1 row)
+
+SELECT relname, relpages, reltuples FROM pg_class WHERE relname = 't_pkey';
+ relname | relpages | reltuples 
+---------+----------+-----------
+ t_pkey  |        2 |         3
+(1 row)
+
+-- Only live tuples count.
+DELETE FROM t WHERE a = 2;
+INSERT INTO t VALUES (4, 'w');
+ANALYZE t;
+SELECT relname, relpages, reltuples FROM pg_class WHERE relname = 't';
+ relname | relpages | reltuples 
+---------+----------+-----------
+ t       |        1 |         3
+(1 row)
+
+-- An index is skipped; an unknown relation is an error; no name means
+-- every table.
+ANALYZE t_pkey;
+ANALYZE nope;
+ERROR:  relation "nope" does not exist
+ANALYZE;
+SELECT relname, relpages FROM pg_class WHERE relname = 'pg_class';
+ relname  | relpages 
+----------+----------
+ pg_class |        1
+(1 row)
+
