@@ -207,9 +207,9 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 	}
 	switch p.tok.Text {
 	case "create":
-		return p.parseCreateTable()
+		return p.parseCreate()
 	case "drop":
-		return p.parseDropTable()
+		return p.parseDrop()
 	case "insert":
 		return p.parseInsert()
 	case "select":
@@ -230,10 +230,29 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 	return nil, p.syntaxError("statement")
 }
 
-func (p *parser) parseCreateTable() (ast.Stmt, error) {
+// parseCreate dispatches CREATE TABLE and CREATE [UNIQUE] INDEX.
+func (p *parser) parseCreate() (ast.Stmt, error) {
 	if err := p.expect("create"); err != nil {
 		return nil, err
 	}
+	switch {
+	case p.isKeyword("table"):
+		return p.parseCreateTable()
+	case p.isKeyword("index"):
+		return p.parseCreateIndex(false)
+	case p.isKeyword("unique"):
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if !p.isKeyword("index") {
+			return nil, p.syntaxError("INDEX")
+		}
+		return p.parseCreateIndex(true)
+	}
+	return nil, p.syntaxError("TABLE or INDEX")
+}
+
+func (p *parser) parseCreateTable() (ast.Stmt, error) {
 	if err := p.expect("table"); err != nil {
 		return nil, err
 	}
@@ -314,16 +333,58 @@ func (p *parser) parseColumnDef() (ast.ColumnDef, error) {
 	}
 }
 
-func (p *parser) parseDropTable() (ast.Stmt, error) {
-	if err := p.expect("drop"); err != nil {
-		return nil, err
-	}
-	if err := p.expect("table"); err != nil {
+// parseCreateIndex parses INDEX name ON table (column) after CREATE
+// [UNIQUE].
+func (p *parser) parseCreateIndex(unique bool) (ast.Stmt, error) {
+	if err := p.expect("index"); err != nil {
 		return nil, err
 	}
 	name, err := p.ident()
 	if err != nil {
 		return nil, err
+	}
+	if err := p.expect("on"); err != nil {
+		return nil, err
+	}
+	table, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKind(lexer.LParen); err != nil {
+		return nil, err
+	}
+	column, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expectKind(lexer.RParen); err != nil {
+		return nil, err
+	}
+	return &ast.CreateIndex{Name: name, Table: table, Column: column, Unique: unique}, nil
+}
+
+// parseDrop dispatches DROP TABLE and DROP INDEX.
+func (p *parser) parseDrop() (ast.Stmt, error) {
+	if err := p.expect("drop"); err != nil {
+		return nil, err
+	}
+	var index bool
+	switch {
+	case p.isKeyword("table"):
+	case p.isKeyword("index"):
+		index = true
+	default:
+		return nil, p.syntaxError("TABLE or INDEX")
+	}
+	if err := p.advance(); err != nil {
+		return nil, err
+	}
+	name, err := p.ident()
+	if err != nil {
+		return nil, err
+	}
+	if index {
+		return &ast.DropIndex{Name: name}, nil
 	}
 	return &ast.DropTable{Name: name}, nil
 }

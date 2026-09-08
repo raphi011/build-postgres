@@ -14,6 +14,7 @@ import (
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
+	"github.com/raphi011/build-postgres/internal/index"
 	"github.com/raphi011/build-postgres/internal/plan"
 	"github.com/raphi011/build-postgres/internal/planner"
 	"github.com/raphi011/build-postgres/internal/smgr"
@@ -98,8 +99,20 @@ func (s *Session) Exec(sql string) ([]*Result, error) {
 func (s *Session) run(q query.Stmt) (*Result, error) {
 	switch q := q.(type) {
 	case *query.CreateTable:
-		if _, err := s.cat.CreateTable(q.Name, q.Desc, s.xid); err != nil {
+		oid, err := s.cat.CreateTable(q.Name, q.Desc, s.xid)
+		if err != nil {
 			return nil, ddlError(err, q.Name, q.Desc)
+		}
+		if q.PrimaryKey >= 0 {
+			// The index is part of the same statement: if it cannot be
+			// made, PostgreSQL's rollback removes the table too.
+			pkey := q.Name + "_pkey"
+			if _, err := s.cat.CreateIndex(pkey, oid, q.PrimaryKey, true, true, s.xid); err != nil {
+				if derr := s.cat.DropTable(q.Name, s.xid); derr != nil {
+					return nil, derr
+				}
+				return nil, indexError(err, pkey, q.Name)
+			}
 		}
 		return &Result{Tag: "CREATE TABLE"}, nil
 	case *query.DropTable:
@@ -107,6 +120,40 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 			return nil, ddlError(err, q.Name, nil)
 		}
 		return &Result{Tag: "DROP TABLE"}, nil
+	case *query.CreateIndex:
+		idx, err := s.cat.CreateIndex(q.Name, q.Rel.OID, q.Attr, q.Unique, false, s.xid)
+		if err != nil {
+			return nil, indexError(err, q.Name, q.Rel.Name)
+		}
+		rel, err := s.cat.Lookup(q.Rel.Name)
+		if err == nil {
+			err = index.Build(s.pool, rel, idx)
+		}
+		if err != nil {
+			// A failed build leaves nothing behind (D20).
+			if derr := s.cat.DropIndex(q.Name, s.xid); derr != nil {
+				return nil, derr
+			}
+			return nil, err
+		}
+		return &Result{Tag: "CREATE INDEX"}, nil
+	case *query.DropIndex:
+		if err := s.cat.DropIndex(q.Name, s.xid); err != nil {
+			var table string
+			if errors.Is(err, catalog.ErrDependentObjects) {
+				idx, lerr := s.cat.LookupIndex(q.Name)
+				if lerr != nil {
+					return nil, lerr
+				}
+				rel, lerr := s.cat.LookupOID(idx.Rel)
+				if lerr != nil {
+					return nil, lerr
+				}
+				table = rel.Name
+			}
+			return nil, indexError(err, q.Name, table)
+		}
+		return &Result{Tag: "DROP INDEX"}, nil
 	case *query.Begin:
 		return &Result{Tag: "BEGIN"}, nil
 	case *query.Commit:
@@ -167,6 +214,8 @@ func ddlError(err error, name string, desc *tuple.Desc) error {
 		return &Error{Msg: fmt.Sprintf("table %q does not exist", name), Err: err}
 	case errors.Is(err, catalog.ErrSystemTable):
 		return &Error{Msg: fmt.Sprintf("permission denied: %q is a system catalog", name), Err: err}
+	case errors.Is(err, catalog.ErrWrongObjectType):
+		return &Error{Msg: fmt.Sprintf("%q is not a table", name), Err: err}
 	case errors.Is(err, catalog.ErrTooManyColumns):
 		return &Error{Msg: fmt.Sprintf("tables can have at most %d columns", catalog.MaxColumns), Err: err}
 	case errors.Is(err, catalog.ErrDuplicateColumn):
@@ -177,6 +226,25 @@ func ddlError(err error, name string, desc *tuple.Desc) error {
 			}
 			seen[a.Name] = true
 		}
+	}
+	return err
+}
+
+// indexError words a catalog error from index DDL as PostgreSQL does.
+// table is the indexed table, named by the system catalog message.
+func indexError(err error, name, table string) error {
+	switch {
+	case errors.Is(err, catalog.ErrExists):
+		return &Error{Msg: fmt.Sprintf("relation %q already exists", name), Err: err}
+	case errors.Is(err, catalog.ErrNotFound):
+		return &Error{Msg: fmt.Sprintf("index %q does not exist", name), Err: err}
+	case errors.Is(err, catalog.ErrWrongObjectType):
+		return &Error{Msg: fmt.Sprintf("%q is not an index", name), Err: err}
+	case errors.Is(err, catalog.ErrDependentObjects):
+		return &Error{Msg: fmt.Sprintf("cannot drop index %s because constraint %s on table %s requires it",
+			name, name, table), Err: err}
+	case errors.Is(err, catalog.ErrSystemTable):
+		return &Error{Msg: fmt.Sprintf("permission denied: %q is a system catalog", table), Err: err}
 	}
 	return err
 }
@@ -196,6 +264,7 @@ func wrap(err error, sql string) error {
 		anaErr  *analyzer.Error
 		exprErr *expr.Error
 		execErr *executor.Error
+		idxErr  *index.Error
 	)
 	switch {
 	case errors.As(err, &lexErr):
@@ -216,6 +285,8 @@ func wrap(err error, sql string) error {
 		e.Msg = exprErr.Msg
 	case errors.As(err, &execErr):
 		e.Msg = execErr.Msg
+	case errors.As(err, &idxErr):
+		e.Msg = idxErr.Msg
 	default:
 		e.Msg = err.Error()
 	}
@@ -233,6 +304,9 @@ func (s *Session) Describe(name string) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if info.Kind == catalog.RelKindIndex {
+		return s.describeIndex(name)
+	}
 	r := &Result{
 		Title:   fmt.Sprintf("Table %q", name),
 		NoCount: true,
@@ -245,7 +319,48 @@ func (s *Session) Describe(name string) (*Result, error) {
 		}
 		r.Rows = append(r.Rows, []tuple.Datum{a.Name, sqlTypeName(a.Type), nullable})
 	}
+	if len(info.Indexes) > 0 {
+		r.Footer = append(r.Footer, "Indexes:")
+		for _, idx := range info.Indexes {
+			kind := ""
+			switch {
+			case idx.Primary:
+				kind = "PRIMARY KEY, "
+			case idx.Unique:
+				kind = "UNIQUE, "
+			}
+			r.Footer = append(r.Footer, fmt.Sprintf("    %q %sbtree (%s)", idx.Name, kind, info.Desc.Attrs[idx.Attr].Name))
+		}
+	}
 	return r, nil
+}
+
+// describeIndex returns the \d output for an index.
+// PostgreSQL: describeOneTableDetails in describe.c.
+func (s *Session) describeIndex(name string) (*Result, error) {
+	idx, err := s.cat.LookupIndex(name)
+	if err != nil {
+		return nil, err
+	}
+	table, err := s.cat.LookupOID(idx.Rel)
+	if err != nil {
+		return nil, err
+	}
+	col := table.Desc.Attrs[idx.Attr]
+	kind := ""
+	switch {
+	case idx.Primary:
+		kind = "primary key, "
+	case idx.Unique:
+		kind = "unique, "
+	}
+	return &Result{
+		Title:   fmt.Sprintf("Index %q", name),
+		NoCount: true,
+		Columns: []Column{{"Column", tuple.Text}, {"Type", tuple.Text}, {"Key?", tuple.Text}, {"Definition", tuple.Text}},
+		Rows:    [][]tuple.Datum{{col.Name, sqlTypeName(col.Type), "yes", col.Name}},
+		Footer:  []string{fmt.Sprintf("%sbtree, for table %q", kind, table.Name)},
+	}, nil
 }
 
 // sqlTypeName is the SQL name psql prints for a type.
@@ -276,7 +391,7 @@ func (s *Session) Tables() (*Result, error) {
 		Rows:    [][]tuple.Datum{},
 	}
 	for _, info := range infos {
-		if info.OID >= catalog.FirstUserOID {
+		if info.OID >= catalog.FirstUserOID && info.Kind == catalog.RelKindTable {
 			r.Rows = append(r.Rows, []tuple.Datum{info.Name, "table"})
 		}
 	}
@@ -380,6 +495,9 @@ func (r *Result) String() string {
 		} else {
 			b.WriteString("(" + strconv.Itoa(len(r.Rows)) + " rows)\n")
 		}
+	}
+	for _, line := range r.Footer {
+		b.WriteString(line + "\n")
 	}
 	b.WriteByte('\n')
 	return b.String()

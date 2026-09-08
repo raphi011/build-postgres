@@ -401,5 +401,13 @@ func (*DropIndex) stmtNode()   {}
 
 // CreateIndex dumps as "CreateIndex i ON t (16384) (a)", followed by
 // " UNIQUE" for a unique index; DropIndex as "DropIndex i".
-func (s *CreateIndex) String() string { panic("not implemented") }
-func (s *DropIndex) String() string   { panic("not implemented") }
+func (s *CreateIndex) String() string {
+	out := fmt.Sprintf("CreateIndex %s ON %s (%d) (%s)", ast.QuoteIdent(s.Name),
+		ast.QuoteIdent(s.Rel.Name), s.Rel.OID, ast.QuoteIdent(s.Rel.Desc.Attrs[s.Attr].Name))
+	if s.Unique {
+		out += " UNIQUE"
+	}
+	return out
+}
+
+func (s *DropIndex) String() string { return "DropIndex " + ast.QuoteIdent(s.Name) }

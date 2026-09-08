@@ -532,5 +532,14 @@ type DropIndex struct {
 func (*CreateIndex) stmtNode() {}
 func (*DropIndex) stmtNode()   {}
 
-func (s *CreateIndex) String() string { panic("not implemented") }
-func (s *DropIndex) String() string   { panic("not implemented") }
+func (s *CreateIndex) String() string {
+	out := "CREATE "
+	if s.Unique {
+		out += "UNIQUE "
+	}
+	return out + "INDEX " + QuoteIdent(s.Name) + " ON " + QuoteIdent(s.Table) + " (" + QuoteIdent(s.Column) + ")"
+}
+
+func (s *DropIndex) String() string {
+	return "DROP INDEX " + QuoteIdent(s.Name)
+}

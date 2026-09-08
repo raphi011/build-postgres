@@ -98,6 +98,10 @@ func Analyze(stmt ast.Stmt, cat Catalog) (query.Stmt, error) {
 		return a.createTable(s)
 	case *ast.DropTable:
 		return &query.DropTable{Name: s.Name}, nil
+	case *ast.CreateIndex:
+		return a.createIndex(s)
+	case *ast.DropIndex:
+		return &query.DropIndex{Name: s.Name}, nil
 	case *ast.Begin:
 		return &query.Begin{}, nil
 	case *ast.Commit:
@@ -136,6 +140,9 @@ func (a *analyzer) addRel(sc *scope, name, alias string, pos lexer.Pos) (*query.
 	}
 	if err != nil {
 		return nil, err
+	}
+	if info.Kind == catalog.RelKindIndex {
+		return nil, errAt(pos, ErrWrongObjectType, "%q is an index", name)
 	}
 	if alias == "" {
 		alias = name
@@ -452,6 +459,26 @@ func (a *analyzer) createTable(s *ast.CreateTable) (query.Stmt, error) {
 		q.Desc.Attrs = append(q.Desc.Attrs, tuple.Attr{Name: c.Name, Type: c.Type, NotNull: c.NotNull || c.PrimaryKey})
 	}
 	return q, nil
+}
+
+// createIndex binds CREATE INDEX. PostgreSQL opens the table from the
+// utility command, so none of its errors carries a position.
+func (a *analyzer) createIndex(s *ast.CreateIndex) (query.Stmt, error) {
+	info, err := a.cat.Lookup(s.Table)
+	if errors.Is(err, catalog.ErrNotFound) {
+		return nil, errAt(noPos, ErrUndefinedTable, "relation %q does not exist", s.Table)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.Kind == catalog.RelKindIndex {
+		return nil, errAt(noPos, ErrWrongObjectType, "%q is an index", s.Table)
+	}
+	attr := attrIndex(info.Desc, s.Column)
+	if attr < 0 {
+		return nil, errAt(noPos, ErrUndefinedColumn, "column %q does not exist", s.Column)
+	}
+	return &query.CreateIndex{Name: s.Name, Rel: info, Attr: attr, Unique: s.Unique}, nil
 }
 
 // assignValue analyzes a value stored into column attr of table.

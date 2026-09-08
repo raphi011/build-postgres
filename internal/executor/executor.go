@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/raphi011/build-postgres/internal/btree"
 	"github.com/raphi011/build-postgres/internal/bufmgr"
+	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
 	"github.com/raphi011/build-postgres/internal/heap"
+	"github.com/raphi011/build-postgres/internal/index"
 	"github.com/raphi011/build-postgres/internal/plan"
+	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/sql/query"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
@@ -64,6 +68,8 @@ func Build(p plan.Node, env *Env) Node {
 		return &values{rows: p.Rows}
 	case *plan.SeqScan:
 		return &seqScan{env: env, rel: p.Rel}
+	case *plan.IndexScan:
+		return &indexScan{env: env, rel: p.Rel, index: p.Index, quals: p.Quals}
 	case *plan.Filter:
 		return &filter{input: Build(p.Input, env), layout: expr.NewLayout(p.Input.Range()), qual: p.Qual}
 	case *plan.Project:
@@ -180,6 +186,93 @@ func (n *seqScan) Next() (Row, bool, error) {
 
 func (n *seqScan) Close() error {
 	n.scan.Close()
+	return nil
+}
+
+// indexScan reads a key range of an index and fetches each entry's heap
+// tuple, skipping dead ones.
+type indexScan struct {
+	env   *Env
+	rel   *query.RangeEntry
+	index *catalog.IndexInfo
+	quals []query.Expr
+	heap  *heap.Relation
+	scan  *btree.Scan
+	none  bool // a NULL bound: no row can match
+}
+
+func (n *indexScan) Open() error {
+	n.none = false
+	var lo, hi *btree.Bound
+	for _, q := range n.quals {
+		op := q.(*query.OpExpr)
+		v, null, err := expr.Compile(op.Right, expr.NewLayout(nil))(expr.Row{})
+		if err != nil {
+			return err
+		}
+		if null {
+			n.none = true
+			return nil
+		}
+		b := &btree.Bound{Key: v, Inclusive: op.Op == ast.Eq || op.Op == ast.Ge || op.Op == ast.Le}
+		switch op.Op {
+		case ast.Eq:
+			lo, hi = tighten(lo, b, 1), tighten(hi, b, -1)
+		case ast.Gt, ast.Ge:
+			lo = tighten(lo, b, 1)
+		case ast.Lt, ast.Le:
+			hi = tighten(hi, b, -1)
+		default:
+			return fmt.Errorf("executor: index scan cannot use operator %s", op.Op)
+		}
+	}
+	n.heap = heap.Open(n.env.Pool, n.rel.Rel.OID, n.rel.Rel.Desc)
+	n.scan = index.Open(n.env.Pool, n.rel.Rel, n.index).Scan(lo, hi)
+	return nil
+}
+
+// tighten merges a new bound into the current one: for a lower bound
+// (dir 1) the larger key wins, for an upper bound (dir -1) the smaller;
+// at a tie the exclusive bound wins.
+func tighten(cur, b *btree.Bound, dir int) *btree.Bound {
+	if cur == nil {
+		return b
+	}
+	c := expr.Compare(b.Key, cur.Key) * dir
+	if c > 0 || c == 0 && !b.Inclusive {
+		return b
+	}
+	return cur
+}
+
+func (n *indexScan) Next() (Row, bool, error) {
+	if n.none {
+		return Row{}, false, nil
+	}
+	for n.scan.Next() {
+		if len(n.quals) > 0 && n.scan.IsNull() {
+			break
+		}
+		t, err := n.heap.Fetch(n.scan.TID())
+		if err != nil {
+			return Row{}, false, err
+		}
+		if t.Xmax() != 0 {
+			continue
+		}
+		vals, nulls, err := tuple.Deform(n.rel.Rel.Desc, t)
+		if err != nil {
+			return Row{}, false, err
+		}
+		return Row{Row: expr.Row{Values: vals, Nulls: nulls}, TID: n.scan.TID()}, true, nil
+	}
+	return Row{}, false, n.scan.Err()
+}
+
+func (n *indexScan) Close() error {
+	if n.scan != nil {
+		n.scan.Close()
+	}
 	return nil
 }
 
@@ -374,9 +467,11 @@ func (n *limit) Next() (Row, bool, error) {
 
 func (n *limit) Close() error { return n.input.Close() }
 
-// modifyTable writes its input rows to the relation. It pulls every
-// input row before writing the first one, so that an UPDATE never sees
-// the tuple versions it is creating (the Halloween problem).
+// modifyTable writes its input rows to the relation and keeps its
+// indexes in step. It pulls every input row before writing the first
+// one, so that an UPDATE never sees the tuple versions it is creating
+// (the Halloween problem). The unique check runs before the heap write
+// (D20); a delete leaves its index entries behind.
 type modifyTable struct {
 	env    *Env
 	op     plan.ModifyOp
@@ -444,15 +539,27 @@ func (n *modifyTable) write(h *heap.Relation, r Row) error {
 		if err != nil {
 			return err
 		}
-		_, err = h.Update(r.TID, t, n.env.XID)
-		return err
+		if err := index.Check(n.env.Pool, n.rel.Rel, vals, nulls, r.TID); err != nil {
+			return err
+		}
+		tid, err := h.Update(r.TID, t, n.env.XID)
+		if err != nil {
+			return err
+		}
+		return index.Insert(n.env.Pool, n.rel.Rel, vals, nulls, tid)
 	default:
 		t, err := n.form(r.Values, r.Nulls)
 		if err != nil {
 			return err
 		}
-		_, err = h.Insert(t, n.env.XID)
-		return err
+		if err := index.Check(n.env.Pool, n.rel.Rel, r.Values, r.Nulls, tuple.TID{}); err != nil {
+			return err
+		}
+		tid, err := h.Insert(t, n.env.XID)
+		if err != nil {
+			return err
+		}
+		return index.Insert(n.env.Pool, n.rel.Rel, r.Values, r.Nulls, tid)
 	}
 }
 

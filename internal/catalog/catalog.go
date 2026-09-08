@@ -5,9 +5,11 @@ package catalog
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 
+	"github.com/raphi011/build-postgres/internal/btree"
 	"github.com/raphi011/build-postgres/internal/bufmgr"
 	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/tuple"
@@ -119,6 +121,7 @@ type Catalog struct {
 	pool  *bufmgr.Pool
 	class *heap.Relation
 	attr  *heap.Relation
+	index *heap.Relation
 
 	mu      sync.Mutex
 	control Control
@@ -130,6 +133,7 @@ func newCatalog(pool *bufmgr.Pool, ctl Control) *Catalog {
 		pool:    pool,
 		class:   heap.Open(pool, ClassOID, ClassDesc),
 		attr:    heap.Open(pool, AttributeOID, AttributeDesc),
+		index:   heap.Open(pool, IndexOID, IndexDesc),
 		control: ctl,
 		cache:   map[string]*RelationInfo{},
 	}
@@ -160,20 +164,24 @@ func Bootstrap(pool *bufmgr.Pool) (*Catalog, error) {
 	if _, err := heap.Create(pool, AttributeOID, AttributeDesc); err != nil {
 		return nil, err
 	}
+	if _, err := heap.Create(pool, IndexOID, IndexDesc); err != nil {
+		return nil, err
+	}
 	c := newCatalog(pool, ctl)
-	for _, rel := range []struct {
+	catalogs := []struct {
 		oid  tuple.OID
 		name string
-	}{{ClassOID, "pg_class"}, {AttributeOID, "pg_attribute"}} {
-		if err := c.insertClass(rel.oid, rel.name, tuple.BootstrapXID); err != nil {
+		desc *tuple.Desc
+	}{{ClassOID, "pg_class", ClassDesc}, {AttributeOID, "pg_attribute", AttributeDesc}, {IndexOID, "pg_index", IndexDesc}}
+	for _, rel := range catalogs {
+		if err := c.insertClass(rel.oid, rel.name, RelKindTable, tuple.BootstrapXID); err != nil {
 			return nil, err
 		}
 	}
-	if err := c.insertAttributes(ClassOID, ClassDesc, tuple.BootstrapXID); err != nil {
-		return nil, err
-	}
-	if err := c.insertAttributes(AttributeOID, AttributeDesc, tuple.BootstrapXID); err != nil {
-		return nil, err
+	for _, rel := range catalogs {
+		if err := c.insertAttributes(rel.oid, rel.desc, tuple.BootstrapXID); err != nil {
+			return nil, err
+		}
 	}
 	if err := pool.FlushAll(); err != nil {
 		return nil, err
@@ -253,7 +261,7 @@ func (c *Catalog) CreateTable(name string, desc *tuple.Desc, xid tuple.XID) (tup
 	if _, err := heap.Create(c.pool, oid, desc); err != nil {
 		return tuple.InvalidOID, err
 	}
-	if err := c.insertClass(oid, name, xid); err != nil {
+	if err := c.insertClass(oid, name, RelKindTable, xid); err != nil {
 		return tuple.InvalidOID, err
 	}
 	if err := c.insertAttributes(oid, desc, xid); err != nil {
@@ -277,8 +285,20 @@ func (c *Catalog) DropTable(name string, xid tuple.XID) error {
 	if err != nil {
 		return err
 	}
+	if info.Kind != RelKindTable {
+		return ErrWrongObjectType
+	}
 	if info.OID < FirstUserOID {
 		return ErrSystemTable
+	}
+	indexes, err := c.scanIndexes(func(r indexEntry) bool { return r.rel == info.OID })
+	if err != nil {
+		return err
+	}
+	for _, idx := range indexes {
+		if err := c.dropIndex(idx, xid); err != nil {
+			return err
+		}
 	}
 	if err := c.class.Delete(tid, xid); err != nil {
 		return err
@@ -313,7 +333,7 @@ func (c *Catalog) Lookup(name string) (*RelationInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.loadAttributes(info); err != nil {
+	if err := c.load(info); err != nil {
 		return nil, err
 	}
 	c.cache[name] = info
@@ -326,6 +346,11 @@ func (c *Catalog) Lookup(name string) (*RelationInfo, error) {
 func (c *Catalog) LookupOID(oid tuple.OID) (*RelationInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.lookupOID(oid)
+}
+
+// lookupOID is LookupOID with c.mu held.
+func (c *Catalog) lookupOID(oid tuple.OID) (*RelationInfo, error) {
 	for _, info := range c.cache {
 		if info.OID == oid {
 			return info, nil
@@ -335,7 +360,7 @@ func (c *Catalog) LookupOID(oid tuple.OID) (*RelationInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.loadAttributes(info); err != nil {
+	if err := c.load(info); err != nil {
 		return nil, err
 	}
 	c.cache[info.Name] = info
@@ -353,7 +378,7 @@ func (c *Catalog) Tables() ([]*RelationInfo, error) {
 			infos = append(infos, cached)
 			return true, nil
 		}
-		if err := c.loadAttributes(info); err != nil {
+		if err := c.load(info); err != nil {
 			return false, err
 		}
 		c.cache[info.Name] = info
@@ -373,9 +398,9 @@ func (c *Catalog) invalidate() {
 }
 
 // insertClass adds a pg_class row.
-func (c *Catalog) insertClass(oid tuple.OID, name string, xid tuple.XID) error {
+func (c *Catalog) insertClass(oid tuple.OID, name string, kind RelKind, xid tuple.XID) error {
 	t, err := tuple.Form(ClassDesc, []tuple.Datum{
-		int32(oid), name, string(RelKindTable), int32(0), int64(0),
+		int32(oid), name, string(kind), int32(0), int64(0),
 	}, nil)
 	if err != nil {
 		return err
@@ -507,6 +532,17 @@ func (c *Catalog) loadAttributes(info *RelationInfo) error {
 	return nil
 }
 
+// load fills a relation's Desc and, for a table, its Indexes.
+func (c *Catalog) load(info *RelationInfo) error {
+	if err := c.loadAttributes(info); err != nil {
+		return err
+	}
+	if info.Kind == RelKindTable {
+		return c.loadIndexes(info)
+	}
+	return nil
+}
+
 func (c *Catalog) findAttributeTIDs(oid tuple.OID) ([]tuple.TID, error) {
 	attrs, err := c.scanAttributes(oid)
 	if err != nil {
@@ -528,7 +564,49 @@ func (c *Catalog) findAttributeTIDs(oid tuple.OID) ([]tuple.TID, error) {
 // any row written. Does not flush.
 // PostgreSQL: index_create in index.c.
 func (c *Catalog) CreateIndex(name string, rel tuple.OID, attr int, unique, primary bool, xid tuple.XID) (*IndexInfo, error) {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	table, err := c.findClass(func(r *RelationInfo) bool { return r.OID == rel })
+	if err != nil {
+		return nil, err
+	}
+	if table.Kind != RelKindTable {
+		return nil, ErrWrongObjectType
+	}
+	if table.OID < FirstUserOID {
+		return nil, ErrSystemTable
+	}
+	if err := c.loadAttributes(table); err != nil {
+		return nil, err
+	}
+	if _, err := c.findClass(func(r *RelationInfo) bool { return r.Name == name }); err == nil {
+		return nil, ErrExists
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+
+	oid, err := c.newOID()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := btree.Create(c.pool, oid, table.Desc.Attrs[attr].Type); err != nil {
+		return nil, err
+	}
+	if err := c.insertClass(oid, name, RelKindIndex, xid); err != nil {
+		return nil, err
+	}
+	t, err := tuple.Form(IndexDesc, []tuple.Datum{
+		int32(oid), int32(rel), int32(attr + 1), unique, primary,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := c.index.Insert(t, xid); err != nil {
+		return nil, err
+	}
+	c.invalidate()
+	return &IndexInfo{OID: oid, Name: name, Rel: rel, Attr: attr, Unique: unique, Primary: primary}, nil
 }
 
 // DropIndex deletes an index's pg_class and pg_index rows, stamping them
@@ -538,12 +616,152 @@ func (c *Catalog) CreateIndex(name string, rel tuple.OID, attr int, unique, prim
 // removes. Does not flush.
 // PostgreSQL: index_drop in index.c.
 func (c *Catalog) DropIndex(name string, xid tuple.XID) error {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	info, err := c.findClass(func(r *RelationInfo) bool { return r.Name == name })
+	if err != nil {
+		return err
+	}
+	if info.Kind != RelKindIndex {
+		return ErrWrongObjectType
+	}
+	rows, err := c.scanIndexes(func(r indexEntry) bool { return r.oid == info.OID })
+	if err != nil {
+		return err
+	}
+	if len(rows) != 1 {
+		return fmt.Errorf("catalog: index %d has %d pg_index rows", info.OID, len(rows))
+	}
+	if rows[0].primary {
+		return ErrDependentObjects
+	}
+	return c.dropIndex(rows[0], xid)
+}
+
+// dropIndex deletes an index's catalog rows and its file. The cache is
+// invalidated as soon as a row is gone, so a failed Unlink cannot leave
+// a cached table pointing at a missing index.
+func (c *Catalog) dropIndex(idx indexEntry, xid tuple.XID) error {
+	tid, _, err := c.findClassTID(func(r *RelationInfo) bool { return r.OID == idx.oid })
+	if err != nil {
+		return err
+	}
+	defer c.invalidate()
+	if err := c.class.Delete(tid, xid); err != nil {
+		return err
+	}
+	if err := c.index.Delete(idx.tid, xid); err != nil {
+		return err
+	}
+	c.pool.Discard(idx.oid)
+	return c.pool.Store().Unlink(idx.oid)
 }
 
 // LookupIndex finds an index by name. Returns ErrNotFound for an unknown
 // name; ErrWrongObjectType if name is not an index. The result is the
 // pointer held in the table's Indexes, so it is shared and read-only.
 func (c *Catalog) LookupIndex(name string) (*IndexInfo, error) {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	info, err := c.findClass(func(r *RelationInfo) bool { return r.Name == name })
+	if err != nil {
+		return nil, err
+	}
+	if info.Kind != RelKindIndex {
+		return nil, ErrWrongObjectType
+	}
+	rows, err := c.scanIndexes(func(r indexEntry) bool { return r.oid == info.OID })
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) != 1 {
+		return nil, fmt.Errorf("catalog: index %d has %d pg_index rows", info.OID, len(rows))
+	}
+	table, err := c.lookupOID(rows[0].rel)
+	if err != nil {
+		return nil, err
+	}
+	for _, idx := range table.Indexes {
+		if idx.OID == info.OID {
+			return idx, nil
+		}
+	}
+	return nil, fmt.Errorf("catalog: index %d missing from table %d", info.OID, table.OID)
+}
+
+// indexEntry is one pg_index row.
+type indexEntry struct {
+	tid     tuple.TID
+	oid     tuple.OID // indexrelid
+	rel     tuple.OID // indrelid
+	attr    int       // 0-based
+	unique  bool
+	primary bool
+}
+
+// scanIndexes returns the pg_index rows matching pred in heap order.
+func (c *Catalog) scanIndexes(pred func(indexEntry) bool) ([]indexEntry, error) {
+	s := c.index.Scan()
+	defer s.Close()
+	var rows []indexEntry
+	for s.Next() {
+		v, _, err := tuple.Deform(IndexDesc, s.Tuple())
+		if err != nil {
+			return nil, err
+		}
+		r := indexEntry{
+			tid:     s.TID(),
+			oid:     tuple.OID(v[0].(int32)),
+			rel:     tuple.OID(v[1].(int32)),
+			attr:    int(v[2].(int32)) - 1,
+			unique:  v[3].(bool),
+			primary: v[4].(bool),
+		}
+		if pred(r) {
+			rows = append(rows, r)
+		}
+	}
+	return rows, s.Err()
+}
+
+// loadIndexes fills info.Indexes from pg_index and pg_class: the primary
+// key first, then by name.
+// PostgreSQL: RelationGetIndexList in relcache.c.
+func (c *Catalog) loadIndexes(info *RelationInfo) error {
+	rows, err := c.scanIndexes(func(r indexEntry) bool { return r.rel == info.OID })
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		info.Indexes = nil
+		return nil
+	}
+	names := map[tuple.OID]string{}
+	err = c.scanClass(func(_ tuple.TID, r *RelationInfo) (bool, error) {
+		if r.Kind == RelKindIndex {
+			names[r.OID] = r.Name
+		}
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	var idxs []*IndexInfo
+	for _, r := range rows {
+		name, ok := names[r.oid]
+		if !ok {
+			return fmt.Errorf("catalog: index %d has no pg_class row", r.oid)
+		}
+		idxs = append(idxs, &IndexInfo{OID: r.oid, Name: name, Rel: r.rel, Attr: r.attr, Unique: r.unique, Primary: r.primary})
+	}
+	sort.Slice(idxs, func(i, j int) bool {
+		if idxs[i].Primary != idxs[j].Primary {
+			return idxs[i].Primary
+		}
+		return idxs[i].Name < idxs[j].Name
+	})
+	info.Indexes = idxs
+	return nil
 }
