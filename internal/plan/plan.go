@@ -3,6 +3,9 @@
 package plan
 
 import (
+	"strings"
+
+	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/sql/query"
 )
 
@@ -64,7 +67,15 @@ const (
 
 // String returns the operation name as EXPLAIN prints it.
 func (o ModifyOp) String() string {
-	panic("not implemented")
+	switch o {
+	case Insert:
+		return "Insert"
+	case Update:
+		return "Update"
+	case Delete:
+		return "Delete"
+	}
+	return "ModifyOp(?)"
 }
 
 // ModifyTable writes the rows of Input to Rel. For Insert, Input rows are
@@ -101,5 +112,67 @@ func (*ModifyTable) node() {}
 // Filter is a property line of its input.
 // PostgreSQL: ExplainNode in explain.c.
 func Explain(n Node) []string {
-	panic("not implemented")
+	var lines []string
+	explain(n, 0, &lines)
+	return lines
+}
+
+// explain appends the lines for n at the given nesting level. A node's
+// headline is prefixed with "->  " below the root; its properties are
+// indented two past the headline text.
+func explain(n Node, level int, lines *[]string) {
+	head, props, children := describe(n)
+	indent := 0
+	if level > 0 {
+		indent = 2 + 6*(level-1)
+		head = "->  " + head
+	}
+	*lines = append(*lines, strings.Repeat(" ", indent)+head)
+	propIndent := strings.Repeat(" ", 6*level+2)
+	for _, p := range props {
+		*lines = append(*lines, propIndent+p)
+	}
+	for _, c := range children {
+		explain(c, level+1, lines)
+	}
+}
+
+// describe returns a node's headline, its property lines, and its
+// children. Project is transparent; Filter attaches to its input.
+func describe(n Node) (head string, props []string, children []Node) {
+	switch n := n.(type) {
+	case *Result:
+		return "Result", nil, nil
+	case *Values:
+		return `Values Scan on "*VALUES*"`, nil, nil
+	case *SeqScan:
+		head = "Seq Scan on " + ast.QuoteIdent(n.Rel.Rel.Name)
+		if n.Rel.Alias != n.Rel.Rel.Name {
+			head += " " + ast.QuoteIdent(n.Rel.Alias)
+		}
+		return head, nil, nil
+	case *Filter:
+		head, props, children = describe(n.Input)
+		label := "Filter: "
+		if _, ok := n.Input.(*Result); ok {
+			label = "One-Time Filter: "
+		}
+		return head, append(props, label+n.Qual.String()), children
+	case *Project:
+		return describe(n.Input)
+	case *Sort:
+		keys := make([]string, len(n.Keys))
+		for i, k := range n.Keys {
+			keys[i] = k.Expr.String()
+			if k.Desc {
+				keys[i] += " DESC"
+			}
+		}
+		return "Sort", []string{"Sort Key: " + strings.Join(keys, ", ")}, []Node{n.Input}
+	case *Limit:
+		return "Limit", nil, []Node{n.Input}
+	case *ModifyTable:
+		return n.Op.String() + " on " + ast.QuoteIdent(n.Rel.Rel.Name), nil, []Node{n.Input}
+	}
+	return "?", nil, nil
 }
