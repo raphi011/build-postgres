@@ -55,11 +55,14 @@ type DropTable struct {
 }
 
 // Insert is INSERT INTO table [(columns)] VALUES rows. Columns is nil when
-// the column list is omitted.
+// the column list is omitted; ColumnLocs holds the position of each
+// column name. Loc is the position of the table name.
 type Insert struct {
-	Table   string
-	Columns []string
-	Rows    [][]Expr
+	Loc        lexer.Pos
+	Table      string
+	Columns    []string
+	ColumnLocs []lexer.Pos
+	Rows       [][]Expr
 }
 
 // Select is a SELECT statement. From, Where, OrderBy, and Limit are nil
@@ -98,21 +101,27 @@ type Join struct {
 	On    Expr
 }
 
-// Update is UPDATE table SET assignments [WHERE where].
+// Update is UPDATE table SET assignments [WHERE where]. Loc is the
+// position of the table name.
 type Update struct {
+	Loc   lexer.Pos
 	Table string
 	Set   []Assignment
 	Where Expr
 }
 
-// Assignment is column = value in an UPDATE.
+// Assignment is column = value in an UPDATE. Loc is the position of the
+// column name.
 type Assignment struct {
 	Column string
 	Value  Expr
+	Loc    lexer.Pos
 }
 
-// Delete is DELETE FROM table [WHERE where].
+// Delete is DELETE FROM table [WHERE where]. Loc is the position of the
+// table name.
 type Delete struct {
+	Loc   lexer.Pos
 	Table string
 	Where Expr
 }

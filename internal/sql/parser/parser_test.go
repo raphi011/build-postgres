@@ -3,6 +3,7 @@ package parser
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -304,6 +305,32 @@ func TestPositions(t *testing.T) {
 	}
 }
 
+func TestTableNamePositions(t *testing.T) {
+	if ins := parseOne(t, "insert into t values (1)").(*ast.Insert); ins.Loc != at(12, 1, 13) {
+		t.Errorf("insert table at %+v", ins.Loc)
+	}
+	if upd := parseOne(t, "update  t set a = 1").(*ast.Update); upd.Loc != at(8, 1, 9) {
+		t.Errorf("update table at %+v", upd.Loc)
+	}
+	if del := parseOne(t, "delete from\nt").(*ast.Delete); del.Loc != at(12, 2, 1) {
+		t.Errorf("delete table at %+v", del.Loc)
+	}
+}
+
+func TestColumnPositions(t *testing.T) {
+	ins := parseOne(t, "insert into t (a,\n  \"B\") values (1, 2)").(*ast.Insert)
+	if want := []lexer.Pos{at(15, 1, 16), at(20, 2, 3)}; !reflect.DeepEqual(ins.ColumnLocs, want) {
+		t.Errorf("insert columns at %+v, want %+v", ins.ColumnLocs, want)
+	}
+	if ins := parseOne(t, "insert into t values (1)").(*ast.Insert); ins.ColumnLocs != nil {
+		t.Errorf("insert without column list has positions %+v", ins.ColumnLocs)
+	}
+	upd := parseOne(t, "update t set a = 1,\n b = 2").(*ast.Update)
+	if upd.Set[0].Loc != at(13, 1, 14) || upd.Set[1].Loc != at(21, 2, 2) {
+		t.Errorf("assignments at %+v, %+v", upd.Set[0].Loc, upd.Set[1].Loc)
+	}
+}
+
 func TestMultipleStatements(t *testing.T) {
 	cases := []struct {
 		src  string
@@ -406,6 +433,10 @@ func TestSyntaxErrors(t *testing.T) {
 		{"explain create table t (a int4)", at(8, 1, 9), "SELECT, INSERT, UPDATE, or DELETE", `"create"`},
 		{"explain explain select 1", at(8, 1, 9), "SELECT, INSERT, UPDATE, or DELETE", `"explain"`},
 		{"select 1; selec 2", at(10, 1, 11), "statement", `"selec"`},
+		{"SELEC 1", at(0, 1, 1), "statement", `"SELEC"`},
+		{"SELECT 1 FROM t ORDER Bye a", at(22, 1, 23), "BY", `"Bye"`},
+		{`insert into t ("a" "B") values (1)`, at(19, 1, 20), ")", `""B""`},
+		{`insert into t ("a" "x""y") values (1)`, at(19, 1, 20), ")", `""x""y""`},
 		{"select 1\n\n  frm t", at(16, 3, 7), "end of statement", `"t"`},
 		{"select ä, ö é 1", at(17, 1, 15), "end of statement", `"1"`},
 	}
