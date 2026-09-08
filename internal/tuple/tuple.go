@@ -20,6 +20,13 @@ const (
 	FirstNormalXID XID = 3
 )
 
+// OID is an object identifier: the name of a relation on disk and the key of
+// every catalog row.
+type OID uint32
+
+// InvalidOID is never a valid object identifier.
+const InvalidOID OID = 0
+
 // BlockNumber is a 0-based page number within a relation file.
 type BlockNumber uint32
 
