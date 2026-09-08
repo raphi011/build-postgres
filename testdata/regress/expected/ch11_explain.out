@@ -1,0 +1,65 @@
+-- EXPLAIN shows the plan tree; costs arrive in chapter 14.
+CREATE TABLE t (a int4, b text);
+INSERT INTO t VALUES (1, 'x');
+EXPLAIN SELECT * FROM t;
+  QUERY PLAN   
+---------------
+ Seq Scan on t
+(1 row)
+
+EXPLAIN SELECT a FROM t AS x WHERE x.a > 1 AND b IS NOT NULL ORDER BY b DESC, a LIMIT 3;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: x.b DESC, x.a
+         ->  Seq Scan on t x
+               Filter: ((x.a > 1) AND (x.b IS NOT NULL))
+(5 rows)
+
+EXPLAIN SELECT 1;
+ QUERY PLAN 
+------------
+ Result
+(1 row)
+
+EXPLAIN SELECT 1 WHERE false;
+        QUERY PLAN        
+--------------------------
+ Result
+   One-Time Filter: FALSE
+(2 rows)
+
+EXPLAIN INSERT INTO t VALUES (2, 'y'), (3, 'z');
+           QUERY PLAN            
+---------------------------------
+ Insert on t
+   ->  Values Scan on "*VALUES*"
+(2 rows)
+
+EXPLAIN UPDATE t SET b = 'w' WHERE a = 1;
+        QUERY PLAN         
+---------------------------
+ Update on t
+   ->  Seq Scan on t
+         Filter: (t.a = 1)
+(3 rows)
+
+EXPLAIN DELETE FROM t;
+     QUERY PLAN      
+---------------------
+ Delete on t
+   ->  Seq Scan on t
+(2 rows)
+
+-- EXPLAIN does not run the statement.
+SELECT * FROM t;
+ a | b 
+---+---
+ 1 | x
+(1 row)
+
+EXPLAIN SELECT * FROM nope;
+ERROR:  relation "nope" does not exist
+LINE 1: EXPLAIN SELECT * FROM nope;
+                              ^

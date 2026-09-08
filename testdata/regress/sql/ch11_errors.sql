@@ -1,0 +1,33 @@
+-- Error messages and positions.
+CREATE TABLE t (a int4, b text);
+SELEC 1;
+SELECT 1 +;
+SELECT * FROM;
+SELECT a FROM t WHERE;
+SELECT a FROM t ORDER;
+SELECT a b c FROM t;
+SELECT * FROM nope;
+SELECT nope FROM t;
+SELECT t.nope FROM t;
+SELECT x.a FROM t;
+SELECT t.a FROM t AS x;
+SELECT a FROM t, t;
+SELECT a FROM t, t AS u;
+SELECT t.a FROM t, t AS u;
+SELECT * FROM t WHERE b;
+SELECT a + b FROM t;
+SELECT b > 1 FROM t;
+SELECT -b FROM t;
+SELECT a AND true FROM t;
+SELECT NOT a FROM t;
+SELECT * WHERE true;
+SELECT 1 FROM t LIMIT 'x';
+SELECT 1 FROM t LIMIT true;
+SELECT 1
+FROM t
+WHERE nope = 1;
+SELECT 1 / 0;
+SELECT 2147483647 * 2;
+SELECT -9223372036854775807 - 2;
+-- Statements after an error still run.
+SELECT 1;

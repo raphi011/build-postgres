@@ -1,0 +1,69 @@
+// Package executor runs plan trees with the iterator model: every node
+// implements Open, Next, and Close and pulls rows from its input. See
+// chapters/11-executor.
+package executor
+
+import (
+	"errors"
+
+	"github.com/raphi011/build-postgres/internal/bufmgr"
+	"github.com/raphi011/build-postgres/internal/executor/expr"
+	"github.com/raphi011/build-postgres/internal/plan"
+	"github.com/raphi011/build-postgres/internal/tuple"
+)
+
+// Sentinel errors, one per PostgreSQL error class raised at execution.
+var (
+	ErrNotNull         = errors.New("not-null violation") // 23502
+	ErrInvalidRowCount = errors.New("invalid row count")  // 2201W
+)
+
+// Error is an execution error with PostgreSQL's message text.
+type Error struct {
+	Err error
+	Msg string
+}
+
+func (e *Error) Error() string { return e.Msg }
+func (e *Error) Unwrap() error { return e.Err }
+
+// Row is what nodes pass up: the values plus, for rows read from a heap,
+// the tuple's TID so that ModifyTable can find it again.
+type Row struct {
+	expr.Row
+	TID tuple.TID
+}
+
+// Node is an executor node. Open prepares it, Next returns the next row
+// and false when there are no more, and Close releases what Open took.
+// Next must not be called before Open or after it returned false.
+type Node interface {
+	Open() error
+	Next() (Row, bool, error)
+	Close() error
+}
+
+// Env is what nodes need from their surroundings.
+type Env struct {
+	Pool *bufmgr.Pool
+	XID  tuple.XID
+}
+
+// Build turns a plan tree into an executor tree. It does no I/O. Panics
+// on a plan node it does not know.
+// PostgreSQL: ExecInitNode in execProcnode.c.
+func Build(p plan.Node, env *Env) Node {
+	panic("not implemented")
+}
+
+// Exec runs p to completion: Open, every Next, Close. It returns the
+// rows the root produced and the number of rows processed, which is the
+// row count for a query and the number of rows written for ModifyTable.
+// Close runs even after an error. Errors are the nodes' own: *Error
+// wrapping ErrInvalidRowCount for a negative LIMIT, *Error wrapping
+// ErrNotNull for a NULL written to a NOT NULL column, and expression
+// errors unchanged.
+// PostgreSQL: ExecutorStart, ExecutorRun, and ExecutorEnd in execMain.c.
+func Exec(p plan.Node, env *Env) (rows []Row, processed int, err error) {
+	panic("not implemented")
+}

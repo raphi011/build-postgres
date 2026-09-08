@@ -1,0 +1,139 @@
+-- SELECT: projection, expressions, WHERE, three-valued logic.
+CREATE TABLE t (a int4, b text, c bool);
+INSERT INTO t VALUES (1, 'one', true), (2, 'two', false), (3, NULL, NULL), (4, 'four', true);
+SELECT * FROM t;
+ a |  b   | c 
+---+------+---
+ 1 | one  | t
+ 2 | two  | f
+ 3 |      | 
+ 4 | four | t
+(4 rows)
+
+SELECT a, b FROM t;
+ a |  b   
+---+------
+ 1 | one
+ 2 | two
+ 3 | 
+ 4 | four
+(4 rows)
+
+SELECT b AS name, a * 10 AS tens, a + 1, -a, a / 2 FROM t;
+ name | tens | ?column? | ?column? | ?column? 
+------+------+----------+----------+----------
+ one  |   10 |        2 |       -1 |        0
+ two  |   20 |        3 |       -2 |        1
+      |   30 |        4 |       -3 |        1
+ four |   40 |        5 |       -4 |        2
+(4 rows)
+
+SELECT x.b, x.a FROM t AS x;
+  b   | a 
+------+---
+ one  | 1
+ two  | 2
+      | 3
+ four | 4
+(4 rows)
+
+SELECT 1, 'text', true, NULL;
+ ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------
+        1 | text     | t        | 
+(1 row)
+
+SELECT 1 + 2 * 3, (1 + 2) * 3, 7 / 2, -7 / 2, 3000000000 + 1;
+ ?column? | ?column? | ?column? | ?column? |  ?column?  
+----------+----------+----------+----------+------------
+        7 |        9 |        3 |       -3 | 3000000001
+(1 row)
+
+SELECT * FROM t WHERE a > 2;
+ a |  b   | c 
+---+------+---
+ 3 |      | 
+ 4 | four | t
+(2 rows)
+
+SELECT * FROM t WHERE b = 'two';
+ a |  b  | c 
+---+-----+---
+ 2 | two | f
+(1 row)
+
+SELECT * FROM t WHERE c;
+ a |  b   | c 
+---+------+---
+ 1 | one  | t
+ 4 | four | t
+(2 rows)
+
+SELECT * FROM t WHERE NOT c;
+ a |  b  | c 
+---+-----+---
+ 2 | two | f
+(1 row)
+
+SELECT * FROM t WHERE c IS NULL;
+ a | b | c 
+---+---+---
+ 3 |   | 
+(1 row)
+
+SELECT * FROM t WHERE b IS NOT NULL AND a <> 1;
+ a |  b   | c 
+---+------+---
+ 2 | two  | f
+ 4 | four | t
+(2 rows)
+
+SELECT * FROM t WHERE a = 1 OR a = 4;
+ a |  b   | c 
+---+------+---
+ 1 | one  | t
+ 4 | four | t
+(2 rows)
+
+SELECT * FROM t WHERE b = NULL;
+ a | b | c 
+---+---+---
+(0 rows)
+
+SELECT * FROM t WHERE a = '3';
+ a | b | c 
+---+---+---
+ 3 |   | 
+(1 row)
+
+SELECT * FROM t WHERE false;
+ a | b | c 
+---+---+---
+(0 rows)
+
+SELECT a, c IS NULL, c = true, NOT c, c AND a > 1, c OR a > 1 FROM t;
+ a | ?column? | ?column? | ?column? | ?column? | ?column? 
+---+----------+----------+----------+----------+----------
+ 1 | f        | t        | f        | f        | t
+ 2 | f        | f        | t        | f        | t
+ 3 | t        |          |          |          | t
+ 4 | f        | t        | f        | t        | t
+(4 rows)
+
+SELECT a = 1, a < 2, a >= 3, b < 'one', b = 'four' FROM t;
+ ?column? | ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------+----------
+ t        | t        | f        | f        | f
+ f        | f        | f        | f        | f
+ f        | f        | t        |          | 
+ f        | f        | t        | t        | t
+(4 rows)
+
+SELECT a FROM t WHERE 2147483647 + a > 0;
+ERROR:  integer out of range
+SELECT * FROM t WHERE 1 / (a - 2) > 0;
+ERROR:  division by zero
+SELECT count FROM t;
+ERROR:  column "count" does not exist
+LINE 1: SELECT count FROM t;
+               ^

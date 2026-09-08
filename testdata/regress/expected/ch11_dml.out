@@ -1,0 +1,114 @@
+-- UPDATE and DELETE.
+CREATE TABLE t (a int4 NOT NULL, b text, c int4);
+INSERT INTO t VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', NULL);
+UPDATE t SET b = 'TWO' WHERE a = 2;
+SELECT * FROM t ORDER BY a;
+ a |   b   | c  
+---+-------+----
+ 1 | one   | 10
+ 2 | TWO   | 20
+ 3 | three |   
+(3 rows)
+
+UPDATE t SET c = c + 1;
+SELECT * FROM t ORDER BY a;
+ a |   b   | c  
+---+-------+----
+ 1 | one   | 11
+ 2 | TWO   | 21
+ 3 | three |   
+(3 rows)
+
+-- SET expressions see the old row, so this swaps.
+UPDATE t SET a = c, c = a WHERE a = 1;
+SELECT * FROM t ORDER BY a;
+ a  |   b   | c  
+----+-------+----
+  2 | TWO   | 21
+  3 | three |   
+ 11 | one   |  1
+(3 rows)
+
+UPDATE t SET b = NULL, c = NULL WHERE a = 3;
+SELECT * FROM t ORDER BY a;
+ a  |  b  | c  
+----+-----+----
+  2 | TWO | 21
+  3 |     |   
+ 11 | one |  1
+(3 rows)
+
+UPDATE t SET a = 1 WHERE false;
+SELECT * FROM t ORDER BY a;
+ a  |  b  | c  
+----+-----+----
+  2 | TWO | 21
+  3 |     |   
+ 11 | one |  1
+(3 rows)
+
+-- Errors.
+UPDATE t SET a = c WHERE c IS NULL;
+ERROR:  null value in column "a" of relation "t" violates not-null constraint
+UPDATE t SET a = NULL;
+ERROR:  null value in column "a" of relation "t" violates not-null constraint
+UPDATE t SET z = 1;
+ERROR:  column "z" of relation "t" does not exist
+LINE 1: UPDATE t SET z = 1;
+                     ^
+UPDATE t SET a = 'x';
+ERROR:  invalid input syntax for type integer: "x"
+LINE 1: UPDATE t SET a = 'x';
+                         ^
+UPDATE t SET a = 1, a = 2;
+ERROR:  multiple assignments to same column "a"
+UPDATE nope SET a = 1;
+ERROR:  relation "nope" does not exist
+LINE 1: UPDATE nope SET a = 1;
+               ^
+SELECT * FROM t ORDER BY a;
+ a  |  b  | c  
+----+-----+----
+  2 | TWO | 21
+  3 |     |   
+ 11 | one |  1
+(3 rows)
+
+DELETE FROM t WHERE a = 2;
+SELECT * FROM t ORDER BY a;
+ a  |  b  | c 
+----+-----+---
+  3 |     |  
+ 11 | one | 1
+(2 rows)
+
+DELETE FROM t WHERE b IS NULL;
+SELECT * FROM t ORDER BY a;
+ a  |  b  | c 
+----+-----+---
+ 11 | one | 1
+(1 row)
+
+DELETE FROM t WHERE false;
+DELETE FROM t WHERE 'x';
+ERROR:  invalid input syntax for type boolean: "x"
+LINE 1: DELETE FROM t WHERE 'x';
+                            ^
+DELETE FROM nope;
+ERROR:  relation "nope" does not exist
+LINE 1: DELETE FROM nope;
+                    ^
+DELETE FROM t;
+SELECT * FROM t;
+ a | b | c 
+---+---+---
+(0 rows)
+
+-- The table is still there, and takes new rows.
+INSERT INTO t VALUES (9, 'nine', 90);
+SELECT * FROM t;
+ a |  b   | c  
+---+------+----
+ 9 | nine | 90
+(1 row)
+

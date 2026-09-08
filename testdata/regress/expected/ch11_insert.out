@@ -1,0 +1,72 @@
+-- INSERT: value lists, column lists, defaults to NULL, literal typing.
+CREATE TABLE t (a int4 NOT NULL, b text, c bool, d int8);
+INSERT INTO t VALUES (1, 'one', true, 1);
+INSERT INTO t VALUES (2, 'two', false, 3000000000), (3, NULL, NULL, NULL);
+INSERT INTO t (a) VALUES (4);
+INSERT INTO t (b, a) VALUES ('five', 5);
+INSERT INTO t VALUES ('6', 'six', 'yes', '7');
+INSERT INTO t VALUES (7, 'it''s', 'off', -9223372036854775808);
+INSERT INTO t VALUES (1 + 7, 'eight', NOT true, 2 * 4);
+SELECT * FROM t;
+ a |   b   | c |          d           
+---+-------+---+----------------------
+ 1 | one   | t |                    1
+ 2 | two   | f |           3000000000
+ 3 |       |   |                     
+ 4 |       |   |                     
+ 5 | five  |   |                     
+ 6 | six   | t |                    7
+ 7 | it's  | f | -9223372036854775808
+ 8 | eight | f |                    8
+(8 rows)
+
+-- Errors: type, arity, NOT NULL, unknown and repeated columns.
+INSERT INTO t VALUES (9, 9);
+ERROR:  column "b" is of type text but expression is of type integer
+LINE 1: INSERT INTO t VALUES (9, 9);
+                                 ^
+INSERT INTO t VALUES (NULL, 'x');
+ERROR:  null value in column "a" of relation "t" violates not-null constraint
+INSERT INTO t (b) VALUES ('x');
+ERROR:  null value in column "a" of relation "t" violates not-null constraint
+INSERT INTO t VALUES (1, 'x', true, 1, 2);
+ERROR:  INSERT has more expressions than target columns
+LINE 1: INSERT INTO t VALUES (1, 'x', true, 1, 2);
+                                               ^
+INSERT INTO t (a, b, c, d, a) VALUES (1, 'x', true, 1, 2);
+ERROR:  column "a" specified more than once
+LINE 1: INSERT INTO t (a, b, c, d, a) VALUES (1, 'x', true, 1, 2);
+                                   ^
+INSERT INTO t (a, a) VALUES (1, 2);
+ERROR:  column "a" specified more than once
+LINE 1: INSERT INTO t (a, a) VALUES (1, 2);
+                          ^
+INSERT INTO t (a, z) VALUES (1, 2);
+ERROR:  column "z" of relation "t" does not exist
+LINE 1: INSERT INTO t (a, z) VALUES (1, 2);
+                          ^
+INSERT INTO t (a, b) VALUES (1);
+ERROR:  INSERT has more target columns than expressions
+LINE 1: INSERT INTO t (a, b) VALUES (1);
+                          ^
+INSERT INTO t VALUES (2147483648, 'big');
+ERROR:  column "a" is of type integer but expression is of type bigint
+LINE 1: INSERT INTO t VALUES (2147483648, 'big');
+                              ^
+INSERT INTO t VALUES ('x', 'y');
+ERROR:  invalid input syntax for type integer: "x"
+LINE 1: INSERT INTO t VALUES ('x', 'y');
+                              ^
+INSERT INTO t VALUES (1, 'y', 'maybe');
+ERROR:  invalid input syntax for type boolean: "maybe"
+LINE 1: INSERT INTO t VALUES (1, 'y', 'maybe');
+                                      ^
+INSERT INTO nope VALUES (1);
+ERROR:  relation "nope" does not exist
+LINE 1: INSERT INTO nope VALUES (1);
+                    ^
+SELECT a FROM t WHERE a > 8;
+ a 
+---
+(0 rows)
+

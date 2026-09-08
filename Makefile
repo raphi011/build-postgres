@@ -12,8 +12,9 @@ CH07 = $(CH06) ./internal/sql/ast/... ./internal/sql/parser/...
 CH08 = $(CH07) ./internal/catalog/...
 CH09 = $(CH08) ./internal/sql/query/... ./internal/sql/analyzer/...
 CH10 = $(CH09) ./internal/executor/expr/...
+CH11 = $(CH10) ./internal/plan/... ./internal/planner/... ./internal/executor/... ./internal/session/... ./internal/regress/...
 
-.PHONY: build test vet regress test-ch01 test-ch02 test-ch03 test-ch04 test-ch05 test-ch06 test-ch07 test-ch08 test-ch09 test-ch10
+.PHONY: build test vet regress test-ch01 test-ch02 test-ch03 test-ch04 test-ch05 test-ch06 test-ch07 test-ch08 test-ch09 test-ch10 test-ch11
 
 build:
 	$(GO) build ./...
@@ -24,7 +25,8 @@ vet:
 test:
 	$(GO) test -race ./...
 
-# SQL regression suite (chapter 11+).
+# SQL regression suite (chapter 11+). The test-chNN targets set
+# REGRESS_CHAPTER so that only the files up to that chapter run.
 regress:
 	$(GO) test -race ./internal/regress/...
 
@@ -48,3 +50,5 @@ test-ch09:
 	$(GO) test -race $(CH09)
 test-ch10:
 	$(GO) test -race $(CH10)
+test-ch11:
+	REGRESS_CHAPTER=11 $(GO) test -race $(CH11)
