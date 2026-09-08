@@ -1,0 +1,105 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1i s1s s2s s1c s2s
+step s1b: BEGIN;
+step s1i: INSERT INTO t VALUES (2, 'two');
+step s1s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|one
+2|two
+(2 rows)
+
+step s2s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|one
+(1 row)
+
+step s1c: COMMIT;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|one
+2|two
+(2 rows)
+
+
+starting permutation: s1b s1i s2s s1r s2s
+step s1b: BEGIN;
+step s1i: INSERT INTO t VALUES (2, 'two');
+step s2s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|one
+(1 row)
+
+step s1r: ROLLBACK;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|one
+(1 row)
+
+
+starting permutation: s1b s1d s1s s2s s1r s2s
+step s1b: BEGIN;
+step s1d: DELETE FROM t WHERE a = 1;
+step s1s: SELECT * FROM t ORDER BY a;
+a|b
+-+-
+(0 rows)
+
+step s2s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|one
+(1 row)
+
+step s1r: ROLLBACK;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|one
+(1 row)
+
+
+starting permutation: s1b s1u s1s s2i s1c s2i
+step s1b: BEGIN;
+step s1u: UPDATE t SET b = 'uno' WHERE a = 1;
+step s1s: SELECT * FROM t ORDER BY a;
+a|b  
+-+---
+1|uno
+(1 row)
+
+step s2i: SELECT b FROM t WHERE a = 1;
+b  
+---
+one
+(1 row)
+
+step s1c: COMMIT;
+step s2i: SELECT b FROM t WHERE a = 1;
+b  
+---
+uno
+(1 row)
+
+
+starting permutation: s1b s1u s2i s1r s2i
+step s1b: BEGIN;
+step s1u: UPDATE t SET b = 'uno' WHERE a = 1;
+step s2i: SELECT b FROM t WHERE a = 1;
+b  
+---
+one
+(1 row)
+
+step s1r: ROLLBACK;
+step s2i: SELECT b FROM t WHERE a = 1;
+b  
+---
+one
+(1 row)
+

@@ -71,7 +71,7 @@ func reopen(t *testing.T, c *Catalog, dir string) *Catalog {
 func rows(t *testing.T, pool *bufmgr.Pool, oid tuple.OID, desc *tuple.Desc) [][]tuple.Datum {
 	t.Helper()
 	rel := heap.Open(pool, oid, desc)
-	s := rel.Scan()
+	s := rel.Scan(nil)
 	defer s.Close()
 	var out [][]tuple.Datum
 	for s.Next() {
@@ -238,7 +238,7 @@ func TestBootstrapDescribesItself(t *testing.T) {
 	}
 
 	// Rows are stamped with the bootstrap XID.
-	s := heap.Open(pool, ClassOID, ClassDesc).Scan()
+	s := heap.Open(pool, ClassOID, ClassDesc).Scan(nil)
 	defer s.Close()
 	for s.Next() {
 		if s.Tuple().Xmin() != tuple.BootstrapXID {
@@ -345,7 +345,7 @@ func TestCreateTable(t *testing.T) {
 	if got := rows(t, c.Pool(), AttributeOID, AttributeDesc); !reflect.DeepEqual(got, wantAttr) {
 		t.Fatalf("pg_attribute rows\n got %v\nwant %v", got, wantAttr)
 	}
-	s := heap.Open(c.Pool(), ClassOID, ClassDesc).Scan()
+	s := heap.Open(c.Pool(), ClassOID, ClassDesc).Scan(nil)
 	defer s.Close()
 	var xmins []tuple.XID
 	for s.Next() {
@@ -536,6 +536,13 @@ func TestDropTable(t *testing.T) {
 	if _, err := c.LookupOID(oid); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("LookupOID after drop = %v, want ErrNotFound", err)
 	}
+	// The file goes when the transaction commits.
+	if exists, err := c.Pool().Store().Exists(oid); err != nil || !exists {
+		t.Fatalf("relation file before commit: exists=%v err=%v", exists, err)
+	}
+	if err := c.EndTransaction(true); err != nil {
+		t.Fatal(err)
+	}
 	if exists, err := c.Pool().Store().Exists(oid); err != nil || exists {
 		t.Fatalf("relation file after drop: exists=%v err=%v", exists, err)
 	}
@@ -551,7 +558,7 @@ func TestDropTable(t *testing.T) {
 
 	// The deleted rows are still there, stamped with the dropping XID.
 	rel := heap.Open(c.Pool(), ClassOID, ClassDesc)
-	old, err := rel.Fetch(tuple.TID{Block: 0, Off: 4})
+	old, _, err := rel.Fetch(tuple.TID{Block: 0, Off: 4}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -800,7 +807,7 @@ func TestCreateIndex(t *testing.T) {
 	if got, want := rows(t, c.Pool(), AttributeOID, AttributeDesc), append(catalogAttrRows(), attrRows(oid, usersDesc)...); !reflect.DeepEqual(got, want) {
 		t.Fatalf("pg_attribute rows\n got %v\nwant %v", got, want)
 	}
-	s := heap.Open(c.Pool(), IndexOID, IndexDesc).Scan()
+	s := heap.Open(c.Pool(), IndexOID, IndexDesc).Scan(nil)
 	defer s.Close()
 	for s.Next() {
 		if s.Tuple().Xmin() != 11 {
@@ -969,6 +976,9 @@ func TestDropIndex(t *testing.T) {
 	if _, err := c.Lookup("users_name"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("Lookup after drop = %v, want ErrNotFound", err)
 	}
+	if err := c.EndTransaction(true); err != nil {
+		t.Fatal(err)
+	}
 	if exists, err := c.Pool().Store().Exists(name.OID); err != nil || exists {
 		t.Fatalf("index file after drop: exists=%v err=%v", exists, err)
 	}
@@ -989,7 +999,7 @@ func TestDropIndex(t *testing.T) {
 		desc *tuple.Desc
 		tid  tuple.TID
 	}{{ClassOID, ClassDesc, tuple.TID{Block: 0, Off: 6}}, {IndexOID, IndexDesc, tuple.TID{Block: 0, Off: 2}}} {
-		old, err := heap.Open(c.Pool(), r.oid, r.desc).Fetch(r.tid)
+		old, _, err := heap.Open(c.Pool(), r.oid, r.desc).Fetch(r.tid, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1051,6 +1061,9 @@ func TestDropTableDropsIndexes(t *testing.T) {
 		t.Fatalf("DropTable(index) = %v, want ErrWrongObjectType", err)
 	}
 	if err := c.DropTable("users", 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EndTransaction(true); err != nil {
 		t.Fatal(err)
 	}
 	for _, idx := range []*IndexInfo{pkey, name} {
@@ -1164,7 +1177,7 @@ func TestUpdateStats(t *testing.T) {
 	if got := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(got, want) {
 		t.Errorf("pg_class rows\n got %v\nwant %v", got, want)
 	}
-	old, err := heap.Open(c.Pool(), ClassOID, ClassDesc).Fetch(tuple.TID{Block: 0, Off: 4})
+	old, _, err := heap.Open(c.Pool(), ClassOID, ClassDesc).Fetch(tuple.TID{Block: 0, Off: 4}, nil)
 	if err != nil || old.Xmax() != 20 {
 		t.Errorf("old users row: xmax %d, err %v", old.Xmax(), err)
 	}
@@ -1231,5 +1244,178 @@ func TestUpdateControl(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "global", "control.tmp")); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("control.tmp left behind: %v", err)
+	}
+}
+
+// Chapter 17: catalog snapshots.
+
+// fakeSnap is a heap.Snapshot that hides the rows of the transactions in
+// aborted, and of the transactions in running unless they are its own.
+type fakeSnap struct {
+	own              tuple.XID
+	aborted, running map[tuple.XID]bool
+}
+
+func (f *fakeSnap) committed(xid tuple.XID) bool {
+	return xid == f.own || !f.aborted[xid] && !f.running[xid]
+}
+
+func (f *fakeSnap) Visible(t tuple.Tuple) (bool, error) {
+	if !f.committed(t.Xmin()) {
+		return false, nil
+	}
+	return t.Xmax() == tuple.InvalidXID || !f.committed(t.Xmax()), nil
+}
+
+func (f *fakeSnap) Dirty(t tuple.Tuple) (bool, tuple.XID, error) {
+	v, err := f.Visible(t)
+	return v, 0, err
+}
+
+func (f *fakeSnap) Modify(t tuple.Tuple, tid tuple.TID) (heap.TM, error) {
+	switch {
+	case !f.committed(t.Xmin()):
+		return heap.TMInvisible, nil
+	case t.Xmax() == tuple.InvalidXID || f.aborted[t.Xmax()]:
+		return heap.TMOk, nil
+	case t.Xmax() == f.own:
+		return heap.TMSelfModified, nil
+	case f.running[t.Xmax()]:
+		return heap.TMBeingModified, nil
+	}
+	return heap.TMDeleted, nil
+}
+
+func (f *fakeSnap) Wait(xid tuple.XID) {}
+
+func TestCatalogSnapshot(t *testing.T) {
+	c, _ := bootstrap(t)
+	snap := &fakeSnap{own: 30, aborted: map[tuple.XID]bool{}, running: map[tuple.XID]bool{}}
+	c.SetSnapshot(func() heap.Snapshot { return snap })
+	if _, err := c.CreateTable("users", usersDesc, 30); err != nil {
+		t.Fatal(err)
+	}
+	// Own uncommitted DDL is visible to the session itself.
+	if _, err := c.Lookup("users"); err != nil {
+		t.Fatalf("own table: %v", err)
+	}
+	// To another transaction it is not, running or aborted.
+	other := &fakeSnap{own: 31, aborted: map[tuple.XID]bool{}, running: map[tuple.XID]bool{30: true}}
+	c.SetSnapshot(func() heap.Snapshot { return other })
+	if _, err := c.Lookup("users"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("table of a running transaction: %v, want ErrNotFound", err)
+	}
+	other.running[30], other.aborted[30] = false, true
+	if err := c.EndTransaction(false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Lookup("users"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("table of an aborted transaction: %v, want ErrNotFound", err)
+	}
+	if infos, err := c.Tables(); err != nil || len(infos) != 3 {
+		t.Errorf("Tables() = %d relations, %v; want the 3 catalogs", len(infos), err)
+	}
+	// The name is free: the aborted row does not count as a duplicate.
+	if _, err := c.CreateTable("users", usersDesc, 31); err != nil {
+		t.Errorf("CreateTable after an aborted one: %v", err)
+	}
+	if err := c.EndTransaction(true); err != nil {
+		t.Fatal(err)
+	}
+	// A committed drop hides the table; an aborted drop does not, and
+	// keeps the file.
+	other.aborted[32] = true
+	if err := c.DropTable("users", 32); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EndTransaction(false); err != nil {
+		t.Fatal(err)
+	}
+	info, err := c.Lookup("users")
+	if err != nil {
+		t.Fatalf("table after an aborted drop: %v", err)
+	}
+	if exists, err := c.Pool().Store().Exists(info.OID); err != nil || !exists {
+		t.Errorf("file after an aborted drop: exists=%v err=%v", exists, err)
+	}
+	if err := c.DropTable("users", 33); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EndTransaction(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Lookup("users"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("table after a committed drop: %v", err)
+	}
+	if exists, err := c.Pool().Store().Exists(info.OID); err != nil || exists {
+		t.Errorf("file after a committed drop: exists=%v err=%v", exists, err)
+	}
+}
+
+func TestEndTransactionAbort(t *testing.T) {
+	c, _ := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx, err := c.CreateIndex("users_name", oid, 1, false, false, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Abort removes the files the transaction created; the catalog rows
+	// stay, stamped with the aborted ID, for the snapshot to hide.
+	if err := c.EndTransaction(false); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range []tuple.OID{oid, idx.OID} {
+		if exists, err := c.Pool().Store().Exists(o); err != nil || exists {
+			t.Errorf("file %d after abort: exists=%v err=%v", o, exists, err)
+		}
+	}
+	if got := rows(t, c.Pool(), ClassOID, ClassDesc); len(got) != 5 {
+		t.Errorf("pg_class has %d rows after abort, want 5", len(got))
+	}
+	// Created and dropped in one transaction: the file goes either way,
+	// and only once.
+	oid, err = c.CreateTable("orders", ordersDesc, 31)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DropTable("orders", 31); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.EndTransaction(true); err != nil {
+		t.Fatal(err)
+	}
+	if exists, err := c.Pool().Store().Exists(oid); err != nil || exists {
+		t.Errorf("file created and dropped in one transaction: exists=%v err=%v", exists, err)
+	}
+	// Nothing pending: EndTransaction is a no-op.
+	if err := c.EndTransaction(false); err != nil {
+		t.Errorf("EndTransaction with nothing pending: %v", err)
+	}
+}
+
+func TestInvalidate(t *testing.T) {
+	c, _ := bootstrap(t)
+	if _, err := c.CreateTable("users", usersDesc, 30); err != nil {
+		t.Fatal(err)
+	}
+	first, err := c.Lookup("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := c.Lookup("users"); again != first {
+		t.Error("Lookup did not cache")
+	}
+	c.Invalidate()
+	if again, _ := c.Lookup("users"); again == first {
+		t.Error("Invalidate kept the cached entry")
+	}
+	// SetSnapshot invalidates too.
+	first, _ = c.Lookup("users")
+	c.SetSnapshot(nil)
+	if again, _ := c.Lookup("users"); again == first {
+		t.Error("SetSnapshot kept the cached entry")
 	}
 }

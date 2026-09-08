@@ -3,8 +3,6 @@
 Book-style repo: "Build Your Own PostgreSQL" in Go, one chapter per subsystem.
 `docs/PLAN.md` is the chapter plan; `docs/DECISIONS.md` (D1…Dn) records the
 design choices. Read the relevant decision before changing any design.
-While chapters are still being written, `HANDOFF.md` holds the current state
-and next task; it goes away once all planned chapters exist.
 
 ## Two branches, one contract
 

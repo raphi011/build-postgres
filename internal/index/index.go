@@ -5,7 +5,6 @@ package index
 
 import (
 	"errors"
-	"fmt"
 
 	"github.com/raphi011/build-postgres/internal/btree"
 	"github.com/raphi011/build-postgres/internal/bufmgr"
@@ -33,106 +32,36 @@ func (e *Error) Unwrap() error { return e.Err }
 // indexed column. It does no I/O.
 // PostgreSQL: index_open in indexam.c.
 func Open(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo) *btree.Tree {
-	return btree.Open(pool, idx.OID, rel.Desc.Attrs[idx.Attr].Type)
-}
-
-// key returns the index key of a row: nil for NULL.
-func key(idx *catalog.IndexInfo, vals []tuple.Datum, nulls []bool) tuple.Datum {
-	if nulls[idx.Attr] {
-		return nil
-	}
-	return vals[idx.Attr]
+	panic("not implemented")
 }
 
 // Check verifies that a row with values vals (nulls marking NULLs) can
 // be indexed in every index of rel, so that Insert cannot fail after the
 // heap tuple is written: every key forms an index tuple no larger than
-// btree.MaxItemSize, and CheckUnique passes. A key too large is a *Error
-// wrapping ErrTooLarge with the message `index row size N exceeds btree
-// version 4 maximum 2704 for index "name"`, N being the tuple's size.
-// Nothing is written.
+// btree.MaxItemSize, and CheckUnique passes under snap. A key too large
+// is a *Error wrapping ErrTooLarge with the message `index row size N
+// exceeds btree version 4 maximum 2704 for index "name"`, N being the
+// tuple's size. Nothing is written.
 // PostgreSQL: _bt_check_third_page in nbtutils.c, ExecInsertIndexTuples
 // in execIndexing.c.
-func Check(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID) error {
-	for _, idx := range rel.Indexes {
-		k := key(idx, vals, nulls)
-		if k == nil {
-			continue
-		}
-		if _, err := btree.FormIndexTuple(rel.Desc.Attrs[idx.Attr].Type, k, tuple.TID{}); err != nil {
-			return tooLarge(err, idx, k)
-		}
-	}
-	return CheckUnique(pool, rel, vals, nulls, except)
-}
-
-// tooLarge turns btree.ErrKeyTooLarge into the ErrTooLarge error for
-// key k of idx; any other error is returned as is.
-func tooLarge(err error, idx *catalog.IndexInfo, k tuple.Datum) error {
-	if !errors.Is(err, btree.ErrKeyTooLarge) {
-		return err
-	}
-	size := btree.HeaderSize
-	switch v := k.(type) {
-	case int32:
-		size += 4
-	case int64:
-		size += 8
-	case bool:
-		size++
-	case string:
-		size += 4 + len(v)
-	}
-	return &Error{Err: ErrTooLarge, Msg: fmt.Sprintf(
-		"index row size %d exceeds btree version 4 maximum %d for index %q", size, btree.MaxItemSize, idx.Name)}
+func Check(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID, snap heap.Snapshot) error {
+	panic("not implemented")
 }
 
 // CheckUnique verifies that a row with values vals (nulls marking NULLs)
 // can be stored in rel without violating a unique index: for every
 // unique index of rel, no live heap tuple other than the one at except
 // (the zero TID for an insert, the old version for an update) has the
-// same key. A NULL key never conflicts. Returns a *Error wrapping
+// same key. Live is what snap's Dirty reports: a tuple another running
+// transaction inserted or deleted makes the check wait for that
+// transaction and look again, so that two transactions cannot both
+// insert a key. A NULL key never conflicts. With a nil snap a tuple is
+// live while its xmax is zero. Returns a *Error wrapping
 // ErrUniqueViolation with the message
 // `duplicate key value violates unique constraint "name"`.
 // PostgreSQL: _bt_check_unique in nbtinsert.c.
-func CheckUnique(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID) error {
-	h := heap.Open(pool, rel.OID, rel.Desc)
-	for _, idx := range rel.Indexes {
-		if !idx.Unique || nulls[idx.Attr] {
-			continue
-		}
-		k := vals[idx.Attr]
-		s := Open(pool, rel, idx).Scan(&btree.Bound{Key: k, Inclusive: true}, &btree.Bound{Key: k, Inclusive: true})
-		conflict, err := liveEntry(s, h, except)
-		s.Close()
-		if err != nil {
-			return err
-		}
-		if conflict {
-			return &Error{Err: ErrUniqueViolation,
-				Msg: fmt.Sprintf("duplicate key value violates unique constraint %q", idx.Name)}
-		}
-	}
-	return nil
-}
-
-// liveEntry reports whether s yields an entry, other than except, whose
-// heap tuple is live.
-func liveEntry(s *btree.Scan, h *heap.Relation, except tuple.TID) (bool, error) {
-	for s.Next() {
-		tid := s.TID()
-		if tid == except {
-			continue
-		}
-		t, err := h.Fetch(tid)
-		if err != nil {
-			return false, err
-		}
-		if t.Xmax() == 0 {
-			return true, nil
-		}
-	}
-	return false, s.Err()
+func CheckUnique(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID, snap heap.Snapshot) error {
+	panic("not implemented")
 }
 
 // Insert adds an entry pointing at tid to every index of rel for the row
@@ -140,41 +69,24 @@ func liveEntry(s *btree.Scan, h *heap.Relation, except tuple.TID) (bool, error) 
 // before writing the heap tuple.
 // PostgreSQL: ExecInsertIndexTuples in execIndexing.c.
 func Insert(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, tid tuple.TID) error {
-	for _, idx := range rel.Indexes {
-		if err := Open(pool, rel, idx).Insert(key(idx, vals, nulls), tid); err != nil {
-			return err
-		}
-	}
-	return nil
+	panic("not implemented")
 }
 
-// Build fills the empty index idx from every visible tuple of rel, in
-// heap order. For a unique index two tuples with the same non-NULL key
-// stop the build with a *Error wrapping ErrUniqueViolation and the
-// message `could not create unique index "name"`; a key too large stops
-// it with the ErrTooLarge error of Check. The entries inserted so far
-// stay in the file, and the caller drops the index.
-// PostgreSQL: index_build and _bt_load in nbtsort.c.
-func Build(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo) error {
-	tree := Open(pool, rel, idx)
-	seen := map[tuple.Datum]bool{}
-	s := heap.Open(pool, rel.OID, rel.Desc).Scan()
-	defer s.Close()
-	for s.Next() {
-		vals, nulls, err := tuple.Deform(rel.Desc, s.Tuple())
-		if err != nil {
-			return err
-		}
-		k := key(idx, vals, nulls)
-		if idx.Unique && k != nil {
-			if seen[k] {
-				return &Error{Err: ErrUniqueViolation, Msg: fmt.Sprintf("could not create unique index %q", idx.Name)}
-			}
-			seen[k] = true
-		}
-		if err := tree.Insert(k, s.TID()); err != nil {
-			return tooLarge(err, idx, k)
-		}
-	}
-	return s.Err()
+// Build fills the empty index idx from the tuples of rel, in heap
+// order: every version some snapshot may still see, which is all of
+// them but those whose inserting transaction aborted, so a deleted
+// tuple is indexed too, and one a running transaction is inserting or
+// deleting. For a unique index two live tuples (committed and not
+// deleted, as snap's Dirty reports) with the same non-NULL key stop the
+// build with a *Error wrapping ErrUniqueViolation and the message
+// `could not create unique index "name"`; to know whether a tuple a
+// running transaction is inserting or deleting counts, the build waits
+// for that transaction. A key too large stops it with the ErrTooLarge
+// error of Check. With a nil snap the tuples whose xmax is zero are
+// indexed and all count as live. The entries inserted so far stay in
+// the file, and the caller drops the index.
+// PostgreSQL: heapam_index_build_range_scan in heapam_handler.c,
+// _bt_load in nbtsort.c.
+func Build(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo, snap heap.Snapshot) error {
+	panic("not implemented")
 }

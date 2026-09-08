@@ -171,8 +171,25 @@ before the heap tuple is written, unlike PostgreSQL, which inserts the
 heap tuple first and relies on the transaction abort to remove it: there
 is no rollback until chapter 16, and a violation must leave nothing
 behind. For the same reason the size limit of an index tuple is checked
-there too (`index.Check`), so that `index.Insert` cannot fail after the
-heap write. Index scans exist as an executor node from this chapter; the
+there too (`index.Check`), which is the only part of the check that
+cannot change under the checker's feet.
+
+The unique part can, so `index.Insert` repeats it. A check that reads the
+index and returns, with the write following separately, decides nothing:
+two transactions both find the key absent, both write it, and the index
+holds a duplicate that a later `REINDEX` refuses to build. PostgreSQL has
+no separate window because `_bt_check_unique` runs inside `_bt_doinsert`
+with the leaf page's write lock held. There is no such page lock here —
+the check scans through a `btree.Scan`, which unpins every page it leaves
+— so `internal/index` keeps one mutex per relation OID and holds it
+across the repeated check and the index writes. It is never held across a
+wait for another transaction: the wait releases it and the check starts
+again, since the transaction being waited for may want it too. It is also
+never held across the heap write, which is why the heap tuple goes in
+first and the repeat can find a conflict after it: under MVCC the
+transaction aborts and buries it; before chapter 16 that leaves a row
+behind, which is the price of a race those chapters have no way to
+resolve anyway. Index scans exist as an executor node from this chapter; the
 planner keeps choosing sequential scans until chapter 14 has statistics
 to choose with.
 
@@ -231,3 +248,67 @@ relation files before `Commit` writes the bit: a log that vouches for
 pages still in memory is worse than one that says nothing (D11). IDs
 are assigned at `Begin` rather than at the first write, so a `SELECT`
 consumes one; lazy assignment is an optimisation the tests do not need.
+
+## D24: One snapshot interface, waits in the heap, files removed at commit
+
+Chapter 17's visibility rules need the transaction manager, and the
+transaction manager (through the control file) needs the catalog, which
+needs the heap; so the heap cannot import `mvcc`. The heap instead
+declares the `Snapshot` interface it asks its questions of, mirroring the
+four `HeapTupleSatisfies*` entry points it needs (`Visible`, `Dirty`,
+`Modify`, and `Wait`), and `mvcc.Snapshot` implements it over
+`txn.Manager`. A nil `Snapshot` is the rule of chapters 5 to 16, so
+those chapters' tests pass nil and change nothing else. The wait for a
+transaction that holds a tuple lives in `heap.Delete` and `Update`, as
+in `heap_delete`; the executor handles what comes after the wait
+(EvalPlanQual under READ COMMITTED, the serialization failure under
+REPEATABLE READ). Command IDs are not needed because `ModifyTable`
+materialises its input (chapter 11), so a statement never sees its own
+new versions.
+
+Two consequences for earlier chapters. The catalog no longer unlinks a
+relation file in `DropTable`: a rolled-back `DROP TABLE` must keep its
+data, so the file is removed by `EndTransaction(true)` and a rolled-back
+`CREATE TABLE`'s file by `EndTransaction(false)`, PostgreSQL's pending
+deletes. And the catalog reads with a fresh snapshot per scan rather
+than the transaction's, as PostgreSQL's catalog snapshot does, so that
+DDL committed by another session is seen at once even under REPEATABLE
+READ; each session owns a `Catalog` whose relation cache is dropped at
+every statement, in place of shared invalidation messages.
+
+Rejected: a `Session` per goroutine over the old single-session design,
+with a global lock around each statement. It would pass the plan's
+tests without any concurrency, which is the opposite of the chapter's
+point.
+
+## D25: Update checks first and buries the new version if it loses
+
+`heap.Update` inserts the new version between the two halves of the
+delete: it asks `Modify` whether it may replace the old tuple, inserts,
+and only then stamps xmax and the ctid. The order is chapter 5's, and it
+is what makes a failed insert harmless — an insert that cannot get a
+buffer must not leave a row deleted with nothing to replace it, and there
+is no undo log to put it back.
+
+The cost is that the check no longer decides the outcome. Another
+transaction can take the row for the whole length of the insert, so the
+stamp asks `Modify` again under the old version's page lock; that second
+call is where two concurrent updates are serialised, and the loser comes
+back with `ErrAlreadyDeleted` having already inserted a tuple. It stamps
+that tuple with its own xid before returning, so xmin and xmax are the
+same transaction and no snapshot sees it, its own included. Stamping a
+version nobody has been told about is not an undo: the tuple was never
+reachable, no ctid points at it, and no index entry was written for it
+(the executor indexes only after `Update` returns).
+
+PostgreSQL is not in this position. `heap_update` sets a *lock-only*
+xmax on the old version before it goes looking for a page, so a
+concurrent updater waits on a tuple that is still live, and the lock is
+released by the transaction rather than undone. That needs
+`HEAP_XMAX_LOCK_ONLY`, a visibility rule that ignores such an xmax, and
+a `Lock` that writes — the row locks chapter 17 leaves out of scope.
+
+Rejected: stamping the old version's xmax before the insert, as chapters
+5 to 16 did before this. It serialises two updaters on the old tuple,
+which is why it looked right, but a failed insert then leaves a row
+deleted with no replacement and no way to put it back.

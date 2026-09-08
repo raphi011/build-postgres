@@ -91,6 +91,9 @@ var golden = []struct{ src, want string }{
 	{"delete from t where id = 3", "DELETE FROM t WHERE (id = 3)"},
 	// Transactions
 	{"begin", "BEGIN"},
+	{"begin isolation level read committed", "BEGIN ISOLATION LEVEL READ COMMITTED"},
+	{"BEGIN ISOLATION LEVEL READ UNCOMMITTED", "BEGIN ISOLATION LEVEL READ COMMITTED"},
+	{"begin isolation level repeatable read", "BEGIN ISOLATION LEVEL REPEATABLE READ"},
 	{"commit", "COMMIT"},
 	{"rollback", "ROLLBACK"},
 	// EXPLAIN
@@ -450,6 +453,11 @@ func TestSyntaxErrors(t *testing.T) {
 		{"delete t", at(7, 1, 8), "FROM", `"t"`},
 		{"delete from t where", at(19, 1, 20), "expression", "end of input"},
 		{"begin transaction", at(6, 1, 7), "end of statement", `"transaction"`},
+		{"begin isolation", at(15, 1, 16), "LEVEL", "end of input"},
+		{"begin isolation level serializable", at(22, 1, 23), "READ or REPEATABLE", `"serializable"`},
+		{"begin isolation level read", at(26, 1, 27), "COMMITTED or UNCOMMITTED", "end of input"},
+		{"begin isolation level repeatable", at(32, 1, 33), "READ", "end of input"},
+		{"begin isolation level read committed 1", at(37, 1, 38), "end of statement", `"1"`},
 		{"commit 1", at(7, 1, 8), "end of statement", `"1"`},
 		{"explain", at(7, 1, 8), "SELECT, INSERT, UPDATE, or DELETE", "end of input"},
 		{"explain create table t (a int4)", at(8, 1, 9), "SELECT, INSERT, UPDATE, or DELETE", `"create"`},

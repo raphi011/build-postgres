@@ -84,12 +84,13 @@ type Token struct {
 // to it.
 var keywords = map[string]bool{
 	"analyze": true, "and": true, "as": true, "asc": true, "begin": true, "by": true,
-	"commit": true, "create": true, "delete": true, "desc": true,
+	"commit": true, "committed": true, "create": true, "delete": true, "desc": true,
 	"drop": true, "explain": true, "false": true, "from": true,
-	"index": true, "insert": true, "into": true, "is": true, "join": true,
-	"key": true, "limit": true, "not": true, "null": true, "on": true,
-	"or": true, "order": true, "primary": true, "rollback": true,
-	"select": true, "set": true, "table": true, "true": true,
+	"index": true, "insert": true, "into": true, "is": true, "isolation": true,
+	"join": true, "key": true, "level": true, "limit": true, "not": true,
+	"null": true, "on": true, "or": true, "order": true, "primary": true,
+	"read": true, "repeatable": true, "rollback": true, "select": true,
+	"set": true, "table": true, "true": true, "uncommitted": true,
 	"unique": true, "update": true, "values": true, "where": true,
 }
 

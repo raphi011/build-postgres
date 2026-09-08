@@ -3,3 +3,4 @@
 *.test
 *.out.diff
 /testdata/regress/results/
+/testdata/isolation/results/

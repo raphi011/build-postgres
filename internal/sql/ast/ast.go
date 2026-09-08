@@ -3,8 +3,6 @@
 package ast
 
 import (
-	"strings"
-
 	"github.com/raphi011/build-postgres/internal/sql/lexer"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
@@ -128,8 +126,26 @@ type Delete struct {
 	Where Expr
 }
 
-// Begin is BEGIN.
-type Begin struct{}
+// Begin is BEGIN [ISOLATION LEVEL level].
+type Begin struct {
+	Isolation Isolation
+}
+
+// Isolation is a transaction isolation level. READ UNCOMMITTED parses
+// as READ COMMITTED, which is how PostgreSQL treats it.
+type Isolation int
+
+const (
+	// DefaultIsolation is BEGIN without a level: the session's default,
+	// READ COMMITTED.
+	DefaultIsolation Isolation = iota
+	ReadCommitted
+	RepeatableRead
+)
+
+func (i Isolation) String() string {
+	panic("not implemented")
+}
 
 // Commit is COMMIT.
 type Commit struct{}
@@ -176,17 +192,9 @@ const (
 	Or
 )
 
-var binOpNames = [...]string{
-	Eq: "=", Ne: "<>", Lt: "<", Le: "<=", Gt: ">", Ge: ">=",
-	Add: "+", Sub: "-", Mul: "*", Div: "/", And: "AND", Or: "OR",
-}
-
 // String returns the operator as written in SQL.
 func (o BinOp) String() string {
-	if o < 1 || int(o) >= len(binOpNames) {
-		return "BinOp(?)"
-	}
-	return binOpNames[o]
+	panic("not implemented")
 }
 
 // UnOp is a prefix operator.
@@ -199,13 +207,7 @@ const (
 
 // String returns the operator as written in SQL.
 func (o UnOp) String() string {
-	switch o {
-	case Neg:
-		return "-"
-	case Not:
-		return "NOT"
-	}
-	return "UnOp(?)"
+	panic("not implemented")
 }
 
 // IntLit is an integer literal. Text holds the digits as written; the
@@ -293,232 +295,38 @@ func (*IsNull) exprNode()     {}
 // double-quoted otherwise. Inside the quotes a " is doubled.
 // PostgreSQL: quote_identifier in ruleutils.c.
 func QuoteIdent(name string) string {
-	if isBareIdent(name) {
-		return name
-	}
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-}
-
-func isBareIdent(name string) bool {
-	if name == "" || lexer.IsKeyword(name) {
-		return false
-	}
-	for i, r := range name {
-		switch {
-		case r >= 'a' && r <= 'z', r == '_', r >= 0x80:
-		case r >= '0' && r <= '9', r == '$':
-			if i == 0 {
-				return false
-			}
-		default:
-			return false
-		}
-	}
-	return true
+	panic("not implemented")
 }
 
 // QuoteString returns value as a SQL string literal: single-quoted with
 // every ' doubled and nothing else escaped.
 // PostgreSQL: simple_quote_literal in ruleutils.c.
 func QuoteString(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+	panic("not implemented")
 }
 
-func (s *CreateTable) String() string {
-	var b strings.Builder
-	b.WriteString("CREATE TABLE ")
-	b.WriteString(QuoteIdent(s.Name))
-	b.WriteString(" (")
-	for i, c := range s.Columns {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(QuoteIdent(c.Name))
-		b.WriteByte(' ')
-		b.WriteString(c.Type.String())
-		if c.NotNull {
-			b.WriteString(" NOT NULL")
-		}
-		if c.PrimaryKey {
-			b.WriteString(" PRIMARY KEY")
-		}
-	}
-	b.WriteByte(')')
-	return b.String()
-}
+func (s *CreateTable) String() string { panic("not implemented") }
+func (s *DropTable) String() string   { panic("not implemented") }
+func (s *Insert) String() string      { panic("not implemented") }
+func (s *Select) String() string      { panic("not implemented") }
+func (t *TableRef) String() string    { panic("not implemented") }
+func (j *Join) String() string        { panic("not implemented") }
+func (s *Update) String() string      { panic("not implemented") }
+func (s *Delete) String() string      { panic("not implemented") }
+func (b *Begin) String() string       { panic("not implemented") }
+func (*Commit) String() string        { panic("not implemented") }
+func (*Rollback) String() string      { panic("not implemented") }
+func (s *Explain) String() string     { panic("not implemented") }
 
-func (s *DropTable) String() string {
-	return "DROP TABLE " + QuoteIdent(s.Name)
-}
-
-func (s *Insert) String() string {
-	var b strings.Builder
-	b.WriteString("INSERT INTO ")
-	b.WriteString(QuoteIdent(s.Table))
-	if s.Columns != nil {
-		b.WriteString(" (")
-		for i, c := range s.Columns {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(QuoteIdent(c))
-		}
-		b.WriteByte(')')
-	}
-	b.WriteString(" VALUES ")
-	for i, row := range s.Rows {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteByte('(')
-		writeExprs(&b, row)
-		b.WriteByte(')')
-	}
-	return b.String()
-}
-
-func writeExprs(b *strings.Builder, exprs []Expr) {
-	for i, e := range exprs {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(e.String())
-	}
-}
-
-func (s *Select) String() string {
-	var b strings.Builder
-	b.WriteString("SELECT ")
-	for i, it := range s.Items {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(it.Expr.String())
-		if it.Alias != "" {
-			b.WriteString(" AS ")
-			b.WriteString(QuoteIdent(it.Alias))
-		}
-	}
-	if s.From != nil {
-		b.WriteString(" FROM ")
-		for i, t := range s.From {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(t.String())
-		}
-	}
-	if s.Where != nil {
-		b.WriteString(" WHERE ")
-		b.WriteString(s.Where.String())
-	}
-	if s.OrderBy != nil {
-		b.WriteString(" ORDER BY ")
-		for i, o := range s.OrderBy {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(o.Expr.String())
-			if o.Desc {
-				b.WriteString(" DESC")
-			}
-		}
-	}
-	if s.Limit != nil {
-		b.WriteString(" LIMIT ")
-		b.WriteString(s.Limit.String())
-	}
-	return b.String()
-}
-
-func (t *TableRef) String() string {
-	if t.Alias == "" {
-		return QuoteIdent(t.Name)
-	}
-	return QuoteIdent(t.Name) + " AS " + QuoteIdent(t.Alias)
-}
-
-func (j *Join) String() string {
-	return j.Left.String() + " JOIN " + j.Right.String() + " ON " + j.On.String()
-}
-
-func (s *Update) String() string {
-	var b strings.Builder
-	b.WriteString("UPDATE ")
-	b.WriteString(QuoteIdent(s.Table))
-	b.WriteString(" SET ")
-	for i, a := range s.Set {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteString(QuoteIdent(a.Column))
-		b.WriteString(" = ")
-		b.WriteString(a.Value.String())
-	}
-	if s.Where != nil {
-		b.WriteString(" WHERE ")
-		b.WriteString(s.Where.String())
-	}
-	return b.String()
-}
-
-func (s *Delete) String() string {
-	out := "DELETE FROM " + QuoteIdent(s.Table)
-	if s.Where != nil {
-		out += " WHERE " + s.Where.String()
-	}
-	return out
-}
-
-func (*Begin) String() string    { return "BEGIN" }
-func (*Commit) String() string   { return "COMMIT" }
-func (*Rollback) String() string { return "ROLLBACK" }
-
-func (s *Explain) String() string {
-	if s.CostsOff {
-		return "EXPLAIN (COSTS OFF) " + s.Stmt.String()
-	}
-	return "EXPLAIN " + s.Stmt.String()
-}
-
-func (e *IntLit) String() string { return e.Text }
-func (e *StrLit) String() string { return QuoteString(e.Value) }
-
-func (e *BoolLit) String() string {
-	if e.Value {
-		return "TRUE"
-	}
-	return "FALSE"
-}
-
-func (*NullLit) String() string { return "NULL" }
-
-func (e *ColumnRef) String() string {
-	if e.Table == "" {
-		return QuoteIdent(e.Name)
-	}
-	return QuoteIdent(e.Table) + "." + QuoteIdent(e.Name)
-}
-
-func (*Star) String() string { return "*" }
-
-func (e *BinaryExpr) String() string {
-	return "(" + e.Left.String() + " " + e.Op.String() + " " + e.Right.String() + ")"
-}
-
-func (e *UnaryExpr) String() string {
-	if e.Op == Not {
-		return "(NOT " + e.X.String() + ")"
-	}
-	return "(" + e.Op.String() + e.X.String() + ")"
-}
-
-func (e *IsNull) String() string {
-	if e.Not {
-		return "(" + e.X.String() + " IS NOT NULL)"
-	}
-	return "(" + e.X.String() + " IS NULL)"
-}
+func (e *IntLit) String() string     { panic("not implemented") }
+func (e *StrLit) String() string     { panic("not implemented") }
+func (e *BoolLit) String() string    { panic("not implemented") }
+func (*NullLit) String() string      { panic("not implemented") }
+func (e *ColumnRef) String() string  { panic("not implemented") }
+func (*Star) String() string         { panic("not implemented") }
+func (e *BinaryExpr) String() string { panic("not implemented") }
+func (e *UnaryExpr) String() string  { panic("not implemented") }
+func (e *IsNull) String() string     { panic("not implemented") }
 
 // CreateIndex is CREATE [UNIQUE] INDEX name ON table (column). There is
 // no position: PostgreSQL reports CREATE INDEX errors without one.
@@ -537,17 +345,8 @@ type DropIndex struct {
 func (*CreateIndex) stmtNode() {}
 func (*DropIndex) stmtNode()   {}
 
-func (s *CreateIndex) String() string {
-	out := "CREATE "
-	if s.Unique {
-		out += "UNIQUE "
-	}
-	return out + "INDEX " + QuoteIdent(s.Name) + " ON " + QuoteIdent(s.Table) + " (" + QuoteIdent(s.Column) + ")"
-}
-
-func (s *DropIndex) String() string {
-	return "DROP INDEX " + QuoteIdent(s.Name)
-}
+func (s *CreateIndex) String() string { panic("not implemented") }
+func (s *DropIndex) String() string   { panic("not implemented") }
 
 // Analyze is ANALYZE [table]. Table is "" for the whole database.
 type Analyze struct {
@@ -556,9 +355,4 @@ type Analyze struct {
 
 func (*Analyze) stmtNode() {}
 
-func (s *Analyze) String() string {
-	if s.Table == "" {
-		return "ANALYZE"
-	}
-	return "ANALYZE " + QuoteIdent(s.Table)
-}
+func (s *Analyze) String() string { panic("not implemented") }

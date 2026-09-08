@@ -1,0 +1,90 @@
+Parsed test spec with 2 sessions
+
+starting permutation: rc s i2 s d1 s c s
+step rc: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+(1 row)
+
+step i2: INSERT INTO t VALUES (2);
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+2
+(2 rows)
+
+step d1: DELETE FROM t WHERE a = 1;
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+2
+(1 row)
+
+step c: COMMIT;
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+2
+(1 row)
+
+
+starting permutation: rr s i2 s d1 s c s
+step rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+(1 row)
+
+step i2: INSERT INTO t VALUES (2);
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+(1 row)
+
+step d1: DELETE FROM t WHERE a = 1;
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+(1 row)
+
+step c: COMMIT;
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+2
+(1 row)
+
+
+starting permutation: rr i2 s i3 s c s
+step rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step i2: INSERT INTO t VALUES (2);
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+2
+(2 rows)
+
+step i3: INSERT INTO t VALUES (3);
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+2
+(2 rows)
+
+step c: COMMIT;
+step s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+2
+3
+(3 rows)
+
