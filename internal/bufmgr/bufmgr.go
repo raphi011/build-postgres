@@ -180,15 +180,15 @@ func (p *Pool) victim() (*Buffer, error) {
 	for pinned < len(p.frames) {
 		b := p.frames[p.hand]
 		p.hand = (p.hand + 1) % len(p.frames)
-		if !b.valid {
-			// Freed by Discard or a failed load.
-			return b, nil
-		}
 		if b.pins > 0 {
 			pinned++
 			continue
 		}
 		pinned = 0
+		if !b.valid {
+			// Freed by Discard or a failed load.
+			return b, nil
+		}
 		if b.usage > 0 {
 			b.usage--
 			continue
@@ -244,13 +244,25 @@ func (p *Pool) Flush(b *Buffer) error {
 // the write.
 // PostgreSQL: BufferSync in bufmgr.c.
 func (p *Pool) FlushAll() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	for _, b := range p.frames {
-		if !b.valid {
+		p.mu.Lock()
+		if !b.valid || !b.dirty {
+			p.mu.Unlock()
 			continue
 		}
-		if err := p.flush(b); err != nil {
+		// The pin keeps the frame from being evicted and refilled while
+		// the mutex is down; the content lock is taken before the mutex,
+		// the order MarkDirty already imposes.
+		b.pins++
+		p.mu.Unlock()
+
+		b.RLock()
+		p.mu.Lock()
+		err := p.flush(b)
+		b.pins--
+		p.mu.Unlock()
+		b.RUnlock()
+		if err != nil {
 			return err
 		}
 	}
@@ -268,9 +280,10 @@ func (p *Pool) Discard(rel tuple.OID) {
 	defer p.mu.Unlock()
 	for _, b := range p.frames {
 		if b.valid && b.tag.rel == rel {
+			// The pins stay: a reader may be halfway through the page,
+			// and the frame is not reusable until it lets go.
 			delete(p.table, b.tag)
 			b.valid = false
-			b.pins = 0
 			b.dirty = false
 		}
 	}
