@@ -164,11 +164,11 @@ func (r *Relation) Desc() *tuple.Desc
 func (r *Relation) NBlocks() (tuple.BlockNumber, error)
 
 func (r *Relation) Insert(t tuple.Tuple, xid tuple.XID) (tuple.TID, error)
-func (r *Relation) Fetch(tid tuple.TID) (tuple.Tuple, error)
-func (r *Relation) Delete(tid tuple.TID, xid tuple.XID) error
-func (r *Relation) Update(tid tuple.TID, t tuple.Tuple, xid tuple.XID) (tuple.TID, error)
+func (r *Relation) Fetch(tid tuple.TID, snap Snapshot) (t tuple.Tuple, visible bool, err error)
+func (r *Relation) Delete(tid tuple.TID, xid tuple.XID, snap Snapshot) error
+func (r *Relation) Update(tid tuple.TID, t tuple.Tuple, xid tuple.XID, snap Snapshot) (tuple.TID, error)
 
-func (r *Relation) Scan() *Scan
+func (r *Relation) Scan(snap Snapshot) *Scan
 func (s *Scan) Next() bool
 func (s *Scan) TID() tuple.TID
 func (s *Scan) Tuple() tuple.Tuple
@@ -184,9 +184,13 @@ Semantics the tests depend on:
   bits, sets `ctid` to the tuple's own TID, and returns that TID. A tuple
   longer than `page.MaxItemSize` is `ErrTupleTooLarge` and leaves the
   relation unchanged. Heap pages have no special space.
-- `Fetch` returns a copy of the tuple at `tid`, deleted or not. A block
-  past the end, an item number of zero or past the page's line pointers, or
-  an unused line pointer is `ErrNotFound`.
+- The `snap Snapshot` argument of `Fetch`, `Delete`, `Update`, and
+  `Scan` is chapter 17's; every test of this chapter passes nil, which
+  means the rules below. `Lock` is chapter 17's too; leave it stubbed.
+- `Fetch` returns a copy of the tuple at `tid`, deleted or not, and
+  whether its `xmax` is zero. A block past the end, an item number of
+  zero or past the page's line pointers, or an unused line pointer is
+  `ErrNotFound`.
 - `Delete` stamps `xmax`. A tuple that already has a non-zero `xmax` is
   `ErrAlreadyDeleted`. A missing tuple is `ErrNotFound`.
 - `Update` is `Delete` then `Insert`, and additionally points the old

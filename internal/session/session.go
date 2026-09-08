@@ -5,10 +5,13 @@ package session
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"github.com/raphi011/build-postgres/internal/bufmgr"
 	"github.com/raphi011/build-postgres/internal/catalog"
+	"github.com/raphi011/build-postgres/internal/mvcc"
 	"github.com/raphi011/build-postgres/internal/smgr"
+	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/sql/lexer"
 	"github.com/raphi011/build-postgres/internal/tuple"
 	"github.com/raphi011/build-postgres/internal/txn"
@@ -29,24 +32,72 @@ const (
 	WarnAlreadyTransaction = "there is already a transaction in progress"
 )
 
-// Session is one connection to a data directory. It is not safe for
-// concurrent use; chapter 17 adds concurrent sessions.
-type Session struct {
+// Cluster is one open data directory and what its sessions share: the
+// store, the buffer pool, and the transaction manager. Sessions attach
+// to it with Connect and may run concurrently.
+// PostgreSQL: the postmaster's shared memory.
+type Cluster struct {
 	store *smgr.DataDir
 	pool  *bufmgr.Pool
-	cat   *catalog.Catalog
 	txn   *txn.Manager
+}
+
+// OpenCluster opens the data directory at dir, bootstrapping it first if
+// it has no control file. Any other smgr or catalog error is returned
+// as is.
+// PostgreSQL: PostmasterMain in postmaster.c.
+func OpenCluster(dir string) (*Cluster, error) {
+	panic("not implemented")
+}
+
+// Connect opens a session on the cluster with its own catalog cache and
+// transaction state.
+// PostgreSQL: InitPostgres in postinit.c.
+func (c *Cluster) Connect() (*Session, error) {
+	panic("not implemented")
+}
+
+// Close flushes every dirty page and closes the commit log and the data
+// directory. Sessions still connected must not be used afterwards.
+// Returns the first error.
+func (c *Cluster) Close() error {
+	panic("not implemented")
+}
+
+// Session is one connection to a cluster. A session is not safe for
+// concurrent use itself; sessions on one cluster run concurrently, each
+// seeing the others' transactions through its snapshots.
+type Session struct {
+	cluster *Cluster
+	owner   bool // Close closes the cluster too
+	cat     *catalog.Catalog
 
 	// Transaction state: tx is the current transaction, nil between
 	// statements outside a block; explicit is set between BEGIN and
 	// COMMIT or ROLLBACK; failed is set after an error inside the block.
-	tx       *txn.Transaction
-	explicit bool
-	failed   bool
+	// isolation is the block's level; snap is the snapshot statements
+	// read with, taken per statement under READ COMMITTED and once per
+	// transaction under REPEATABLE READ.
+	tx        *txn.Transaction
+	explicit  bool
+	failed    bool
+	isolation ast.Isolation
+	snap      *mvcc.Snapshot
+	waiting   atomic.Bool // blocked on another transaction
 }
 
-// Open opens the data directory at dir, bootstrapping it first if it has
-// no control file. Any other smgr or catalog error is returned as is.
+// Blocked reports whether the session is waiting for another session's
+// transaction to finish. The isolation test runner uses it to tell a
+// step that blocks from one that is still running.
+// PostgreSQL: pg_isolation_test_session_is_blocked in regress.c.
+func (s *Session) Blocked() bool {
+	panic("not implemented")
+}
+
+// Open opens the data directory at dir as a cluster of its own,
+// bootstrapping it first if it has no control file, and connects one
+// session to it, which closes the cluster with Close. Any other smgr or
+// catalog error is returned as is.
 // PostgreSQL: InitPostgres in postinit.c.
 func Open(dir string) (*Session, error) {
 	panic("not implemented")
@@ -55,8 +106,8 @@ func Open(dir string) (*Session, error) {
 // Catalog returns the session's catalog.
 func (s *Session) Catalog() *catalog.Catalog { return s.cat }
 
-// Close aborts a transaction left open, flushes every dirty page, and
-// closes the commit log and the data directory. Returns the first error.
+// Close aborts a transaction left open and, for a session opened with
+// Open, closes the cluster. Returns the first error.
 // PostgreSQL: ShutdownPostgres in postinit.c.
 func (s *Session) Close() error {
 	panic("not implemented")

@@ -9,17 +9,20 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/raphi011/build-postgres/internal/bufmgr"
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
 	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/index"
+	"github.com/raphi011/build-postgres/internal/mvcc"
 	"github.com/raphi011/build-postgres/internal/plan"
 	"github.com/raphi011/build-postgres/internal/smgr"
 	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/sql/query"
 	"github.com/raphi011/build-postgres/internal/tuple"
+	"github.com/raphi011/build-postgres/internal/txn"
 )
 
 // db is a bootstrapped data directory with one table t (a int4 not null,
@@ -649,7 +652,7 @@ func TestUpdateMaintainsIndexes(t *testing.T) {
 	ia := d.index(t, d.t, "t_a", 0, false)
 	d.seed(t, d.t, threeRows...)
 	for _, idx := range d.t.Rel.Indexes {
-		if err := index.Build(d.env.Pool, d.t.Rel, idx); err != nil {
+		if err := index.Build(d.env.Pool, d.t.Rel, idx, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -672,7 +675,7 @@ func TestUpdateMaintainsIndexes(t *testing.T) {
 	}
 	h := heap.Open(d.env.Pool, d.t.Rel.OID, d.t.Rel.Desc)
 	for _, tid := range got[1:3] {
-		tup, err := h.Fetch(tid)
+		tup, _, err := h.Fetch(tid, nil)
 		if err != nil || tup.Xmax() == 0 {
 			t.Errorf("entry %v: expected a dead tuple, got xmax %d err %v", tid, tup.Xmax(), err)
 		}
@@ -683,7 +686,7 @@ func TestDeleteLeavesIndexEntries(t *testing.T) {
 	d := newDB(t)
 	ia := d.index(t, d.t, "t_a", 0, false)
 	tids := d.seed(t, d.t, threeRows...)
-	if err := index.Build(d.env.Pool, d.t.Rel, ia); err != nil {
+	if err := index.Build(d.env.Pool, d.t.Rel, ia, nil); err != nil {
 		t.Fatal(err)
 	}
 	del := &plan.ModifyTable{Op: plan.Delete, Rel: d.t,
@@ -1317,5 +1320,253 @@ func TestJoinOracle(t *testing.T) {
 				t.Errorf("%s through %s: %d rows, oracle %d", c.name, p.method, strings.Count(got, "\n"), len(want))
 			}
 		}
+	}
+}
+
+// Chapter 17: snapshots and concurrent updates.
+
+// xacts opens a transaction manager on the test's data directory and
+// returns an Env per transaction, each with its own snapshot, at the
+// given isolation level.
+func (d *db) xacts(t *testing.T, level ast.Isolation, n int) ([]*txn.Transaction, []*Env) {
+	t.Helper()
+	m, err := txn.Open(d.env.Pool.Store().Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { m.Close() })
+	var txs []*txn.Transaction
+	for i := 0; i < n; i++ {
+		tx, err := m.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		txs = append(txs, tx)
+	}
+	var envs []*Env
+	for _, tx := range txs {
+		envs = append(envs, &Env{Pool: d.env.Pool, XID: tx.XID, Snapshot: mvcc.Take(m, tx.XID), Isolation: level})
+	}
+	return txs, envs
+}
+
+func TestScanSnapshot(t *testing.T) {
+	d := newDB(t)
+	d.seed(t, d.t, threeRows...)
+	txs, envs := d.xacts(t, ast.ReadCommitted, 2)
+	// The first transaction deletes row 2 and inserts row 4; the second
+	// sees neither through a sequential or an index scan.
+	del := &plan.ModifyTable{Op: plan.Delete, Rel: d.t,
+		Input: &plan.Filter{Input: &plan.SeqScan{Rel: d.t}, Qual: op(ast.Eq, col(d.t, 0), i4(2))}}
+	if _, n, err := Exec(del, envs[0]); err != nil || n != 1 {
+		t.Fatalf("delete: n=%d err=%v", n, err)
+	}
+	if _, _, err := Exec(insertPlan(d.t, []query.Expr{i4(4), str("four"), null(tuple.Bool)}), envs[0]); err != nil {
+		t.Fatal(err)
+	}
+	ia := d.index(t, d.t, "t_a", 0, false)
+	if err := index.Build(d.env.Pool, d.t.Rel, ia, envs[0].Snapshot); err != nil {
+		t.Fatal(err)
+	}
+	scans := []plan.Node{&plan.SeqScan{Rel: d.t}, &plan.IndexScan{Rel: d.t, Index: ia}}
+	for _, p := range scans {
+		rows, _, err := Exec(p, envs[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sorted(render(rows)); got != "1,one,true\n3,three,NULL\n4,four,NULL\n" {
+			t.Errorf("%T for the writer:\n%s", p, got)
+		}
+		rows, _, err = Exec(p, envs[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sorted(render(rows)); got != "1,one,true\n2,NULL,false\n3,three,NULL\n" {
+			t.Errorf("%T for the other:\n%s", p, got)
+		}
+	}
+	// After the commit a new snapshot sees the changes; the old one
+	// does not.
+	if err := txs[0].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	_, fresh := d.xacts(t, ast.ReadCommitted, 1)
+	for _, p := range scans {
+		rows, _, _ := Exec(p, envs[1])
+		if got := sorted(render(rows)); got != "1,one,true\n2,NULL,false\n3,three,NULL\n" {
+			t.Errorf("%T for the old snapshot after the commit:\n%s", p, got)
+		}
+		rows, _, _ = Exec(p, fresh[0])
+		if got := sorted(render(rows)); got != "1,one,true\n3,three,NULL\n4,four,NULL\n" {
+			t.Errorf("%T for a new snapshot:\n%s", p, got)
+		}
+	}
+}
+
+// update returns an UPDATE t SET b = val WHERE a = key plan.
+func update(rel *query.RangeEntry, key int32, val string) *plan.ModifyTable {
+	return &plan.ModifyTable{Op: plan.Update, Rel: rel,
+		Input: &plan.Filter{Input: &plan.SeqScan{Rel: rel}, Qual: op(ast.Eq, col(rel, 0), i4(key))},
+		Set:   []query.Assignment{{Attr: 1, Value: str(val)}}}
+}
+
+// run executes p in env on another goroutine and returns the channel
+// its outcome arrives on.
+func run(p plan.Node, env *Env) chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, n, err := Exec(p, env)
+		if err == nil && n != 1 {
+			err = fmt.Errorf("processed %d rows, want 1", n)
+		}
+		done <- err
+	}()
+	return done
+}
+
+// blocked fails the test if done delivers within a few milliseconds.
+func blocked(t *testing.T, done chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		t.Fatalf("did not wait for the other transaction: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestConcurrentUpdate(t *testing.T) {
+	d := newDB(t)
+	d.seed(t, d.t, threeRows...)
+	txs, envs := d.xacts(t, ast.ReadCommitted, 2)
+	if _, n, err := Exec(update(d.t, 2, "first"), envs[0]); err != nil || n != 1 {
+		t.Fatalf("first update: n=%d err=%v", n, err)
+	}
+	// The second update waits for the first transaction; once that
+	// commits it updates the new version, READ COMMITTED style.
+	done := run(update(d.t, 2, "second"), envs[1])
+	blocked(t, done)
+	if err := txs[0].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := txs[1].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	_, fresh := d.xacts(t, ast.ReadCommitted, 1)
+	rows, _, _ := Exec(&plan.SeqScan{Rel: d.t}, fresh[0])
+	if got := sorted(render(rows)); got != "1,one,true\n2,second,false\n3,three,NULL\n" {
+		t.Errorf("after both updates:\n%s", got)
+	}
+	// The values of the new version are what the second statement
+	// computes with: SET b = b || ... is not available, so check that the
+	// row it updated was the first's version, by TID chain length.
+	h := heap.Open(d.env.Pool, d.t.Rel.OID, d.t.Rel.Desc)
+	old, _, _ := h.Fetch(tuple.TID{Block: 0, Off: 2}, nil)
+	mid, _, _ := h.Fetch(old.Ctid(), nil)
+	if mid.Ctid() == old.Ctid() || mid.Xmin() != txs[0].XID || mid.Xmax() != txs[1].XID {
+		t.Errorf("chain: old ctid %v, middle xmin %d xmax %d ctid %v", old.Ctid(), mid.Xmin(), mid.Xmax(), mid.Ctid())
+	}
+}
+
+func TestConcurrentUpdateAborted(t *testing.T) {
+	d := newDB(t)
+	d.seed(t, d.t, threeRows...)
+	txs, envs := d.xacts(t, ast.ReadCommitted, 2)
+	if _, _, err := Exec(update(d.t, 2, "first"), envs[0]); err != nil {
+		t.Fatal(err)
+	}
+	// The first rolls back: the waiting update proceeds on the original.
+	done := run(update(d.t, 2, "second"), envs[1])
+	blocked(t, done)
+	if err := txs[0].Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	rows, _, _ := Exec(&plan.SeqScan{Rel: d.t}, envs[1])
+	if got := sorted(render(rows)); got != "1,one,true\n2,second,false\n3,three,NULL\n" {
+		t.Errorf("after the abort:\n%s", got)
+	}
+}
+
+func TestConcurrentUpdateRecheck(t *testing.T) {
+	d := newDB(t)
+	d.seed(t, d.t, threeRows...)
+	txs, envs := d.xacts(t, ast.ReadCommitted, 3)
+	// The first transaction moves row 2 out of the second's WHERE: the
+	// second, after waiting, updates nothing. The third deletes row 3
+	// under a fourth's update: nothing to update there either.
+	move := &plan.ModifyTable{Op: plan.Update, Rel: d.t,
+		Input: &plan.Filter{Input: &plan.SeqScan{Rel: d.t}, Qual: op(ast.Eq, col(d.t, 0), i4(2))},
+		Set:   []query.Assignment{{Attr: 0, Value: i4(0)}}}
+	if _, _, err := Exec(move, envs[0]); err != nil {
+		t.Fatal(err)
+	}
+	del := &plan.ModifyTable{Op: plan.Delete, Rel: d.t,
+		Input: &plan.Filter{Input: &plan.SeqScan{Rel: d.t}, Qual: op(ast.Eq, col(d.t, 0), i4(3))}}
+	if _, _, err := Exec(del, envs[2]); err != nil {
+		t.Fatal(err)
+	}
+	both := &plan.ModifyTable{Op: plan.Update, Rel: d.t,
+		Input: &plan.Filter{Input: &plan.SeqScan{Rel: d.t}, Qual: op(ast.Gt, col(d.t, 0), i4(1))},
+		Set:   []query.Assignment{{Attr: 1, Value: str("z")}}}
+	done := make(chan error, 1)
+	go func() {
+		_, n, err := Exec(both, envs[1])
+		if err == nil && n != 0 {
+			err = fmt.Errorf("processed %d rows, want 0", n)
+		}
+		done <- err
+	}()
+	blocked(t, done)
+	if err := txs[0].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	blocked(t, done)
+	if err := txs[2].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := txs[1].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	_, fresh := d.xacts(t, ast.ReadCommitted, 1)
+	rows, _, _ := Exec(&plan.SeqScan{Rel: d.t}, fresh[0])
+	if got := sorted(render(rows)); got != "0,NULL,false\n1,one,true\n" {
+		t.Errorf("after the recheck:\n%s", got)
+	}
+}
+
+func TestConcurrentUpdateRepeatableRead(t *testing.T) {
+	d := newDB(t)
+	d.seed(t, d.t, threeRows...)
+	txs, envs := d.xacts(t, ast.RepeatableRead, 2)
+	if _, _, err := Exec(update(d.t, 2, "first"), envs[0]); err != nil {
+		t.Fatal(err)
+	}
+	done := run(update(d.t, 2, "second"), envs[1])
+	blocked(t, done)
+	if err := txs[0].Commit(); err != nil {
+		t.Fatal(err)
+	}
+	err := <-done
+	var e *Error
+	if !errors.As(err, &e) || !errors.Is(err, ErrSerializationFailure) {
+		t.Fatalf("update under REPEATABLE READ after a concurrent commit: %v", err)
+	}
+	if e.Msg != "could not serialize access due to concurrent update" {
+		t.Errorf("message %q", e.Msg)
+	}
+	// A delete of the same row fails the same way; an abort of the
+	// first would have let both through (TestConcurrentUpdateAborted).
+	del := &plan.ModifyTable{Op: plan.Delete, Rel: d.t,
+		Input: &plan.Filter{Input: &plan.SeqScan{Rel: d.t}, Qual: op(ast.Eq, col(d.t, 0), i4(2))}}
+	if _, _, err := Exec(del, envs[1]); !errors.Is(err, ErrSerializationFailure) {
+		t.Errorf("delete under REPEATABLE READ: %v", err)
 	}
 }

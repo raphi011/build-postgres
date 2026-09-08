@@ -491,7 +491,7 @@ var ErrNotNull, ErrInvalidRowCount error
 type Error struct { Err error; Msg string }
 type Row struct { expr.Row; TID tuple.TID }
 type Node interface { Open() error; Next() (Row, bool, error); Close() error }
-type Env struct { Pool *bufmgr.Pool; XID tuple.XID }
+type Env struct { Pool *bufmgr.Pool; XID tuple.XID; Snapshot heap.Snapshot; Isolation ast.Isolation } // the last two are chapter 17's
 func Build(p plan.Node, env *Env) Node
 func Exec(p plan.Node, env *Env) (rows []Row, processed int, err error)
 ```
@@ -616,7 +616,7 @@ is the number of rows written.
 <details><summary><b><code>seqScan</code>.</b></summary>
 
 Fields: the `Env`, the range entry, and a `*heap.Scan`. `Open` does
-`heap.Open(pool, OID, Desc).Scan()` and returns `scan.Err()`;
+`heap.Open(pool, OID, Desc).Scan(env.Snapshot)` and returns `scan.Err()`;
 `Next` returns `scan.Err()` when `scan.Next()` is false, else
 `tuple.Deform` of `scan.Tuple()` with `scan.TID()`; `Close` closes the
 scan. Chapter 05's scan copies a page's tuples and unpins before returning,

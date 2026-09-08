@@ -4,8 +4,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/tuple"
@@ -327,4 +329,81 @@ func TestConcurrent(t *testing.T) {
 	if got := m.NextXID(); got != tuple.FirstNormalXID+workers*each {
 		t.Errorf("NextXID = %d, want %d", got, tuple.FirstNormalXID+workers*each)
 	}
+}
+
+// Chapter 17.
+
+func TestSnapshot(t *testing.T) {
+	m := open(t, newDir(t, 10))
+	check := func(xmin, xmax tuple.XID, xip []tuple.XID) {
+		t.Helper()
+		gotMin, gotMax, gotXip := m.Snapshot()
+		if gotMin != xmin || gotMax != xmax || !reflect.DeepEqual(gotXip, xip) {
+			t.Errorf("Snapshot() = %d, %d, %v; want %d, %d, %v", gotMin, gotMax, gotXip, xmin, xmax, xip)
+		}
+	}
+	check(10, 10, nil)
+	a, b, c := begin(t, m), begin(t, m), begin(t, m)
+	check(10, 13, []tuple.XID{10, 11, 12})
+	if err := b.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	check(10, 13, []tuple.XID{10, 12})
+	if err := a.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	check(12, 13, []tuple.XID{12})
+	if err := c.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	check(13, 13, nil)
+}
+
+func TestWait(t *testing.T) {
+	m := open(t, newDir(t, 10))
+	tx := begin(t, m)
+	// A transaction that is not running does not block: finished ones,
+	// the reserved IDs, and IDs not handed out.
+	for _, xid := range []tuple.XID{tuple.InvalidXID, tuple.BootstrapXID, tuple.FrozenXID, 9, 11, 1000} {
+		m.Wait(xid)
+	}
+	if got := m.Waiting(); got != 0 {
+		t.Fatalf("Waiting() = %d before anyone waits", got)
+	}
+	done := make(chan struct{})
+	go func() {
+		m.Wait(tx.XID)
+		close(done)
+	}()
+	for m.Waiting() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-done:
+		t.Fatal("Wait returned while the transaction was running")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
+	if got := m.Waiting(); got != 0 {
+		t.Errorf("Waiting() = %d after the wait ended", got)
+	}
+	m.Wait(tx.XID) // finished: returns at once
+
+	// Close releases waiters too.
+	tx = begin(t, m)
+	done = make(chan struct{})
+	go func() {
+		m.Wait(tx.XID)
+		close(done)
+	}()
+	for m.Waiting() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-done
 }

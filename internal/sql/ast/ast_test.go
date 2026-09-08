@@ -98,6 +98,8 @@ func TestString(t *testing.T) {
 			"UPDATE t SET a = 1 WHERE TRUE"},
 		{&Delete{Table: "t"}, "DELETE FROM t"},
 		{&Begin{}, "BEGIN"},
+		{&Begin{Isolation: ReadCommitted}, "BEGIN ISOLATION LEVEL READ COMMITTED"},
+		{&Begin{Isolation: RepeatableRead}, "BEGIN ISOLATION LEVEL REPEATABLE READ"},
 		{&Commit{}, "COMMIT"},
 		{&Rollback{}, "ROLLBACK"},
 		{&Explain{Stmt: &Delete{Table: "t", Where: &BoolLit{}}}, "EXPLAIN DELETE FROM t WHERE FALSE"},

@@ -10,7 +10,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor"
@@ -19,6 +21,7 @@ import (
 	"github.com/raphi011/build-postgres/internal/index"
 	"github.com/raphi011/build-postgres/internal/page"
 	"github.com/raphi011/build-postgres/internal/sql/analyzer"
+	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/sql/lexer"
 	"github.com/raphi011/build-postgres/internal/sql/parser"
 	"github.com/raphi011/build-postgres/internal/tuple"
@@ -155,6 +158,34 @@ func TestPersistence(t *testing.T) {
 	}
 	if _, err := s.Exec("create table t (a int4)"); !errors.Is(err, catalog.ErrExists) {
 		t.Errorf("create existing after reopen: %v", err)
+	}
+}
+
+// TestCommitIsDurableWithoutClose abandons a cluster the way a kill -9
+// would, without Close and so without its FlushAll, and checks that
+// every committed statement is still there.
+func TestCommitIsDurableWithoutClose(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	c, err := OpenCluster(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := c.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(t, s, "create table t (a int4, b text)")
+	exec(t, s, "insert into t values (1, 'x'), (2, 'y')")
+	exec(t, s, "begin")
+	exec(t, s, "insert into t values (3, 'z')")
+	exec(t, s, "commit")
+	exec(t, s, "begin")
+	exec(t, s, "insert into t values (4, 'gone')")
+	// No Close: the pool, the open files and the transaction are lost.
+
+	s2 := open(t, dir)
+	if got := rows(t, s2, "select a from t order by a"); got != "1\n2\n3\n" {
+		t.Errorf("after losing the process: %q, want the three committed rows", got)
 	}
 }
 
@@ -1023,14 +1054,14 @@ func headers(t *testing.T, s *Session, table string) []header {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := heap.Open(s.pool, rel.OID, rel.Desc)
+	h := heap.Open(s.cluster.pool, rel.OID, rel.Desc)
 	n, err := h.NBlocks()
 	if err != nil {
 		t.Fatal(err)
 	}
 	var out []header
 	for blk := tuple.BlockNumber(0); blk < n; blk++ {
-		buf, err := s.pool.Pin(rel.OID, blk)
+		buf, err := s.cluster.pool.Pin(rel.OID, blk)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1043,14 +1074,14 @@ func headers(t *testing.T, s *Session, table string) []header {
 			tup := tuple.Tuple(item)
 			out = append(out, header{tuple.TID{Block: blk, Off: i}, tup.Xmin(), tup.Xmax()})
 		}
-		s.pool.Unpin(buf)
+		s.cluster.pool.Unpin(buf)
 	}
 	return out
 }
 
 func txStatus(t *testing.T, s *Session, xid tuple.XID) txn.Status {
 	t.Helper()
-	st, err := s.txn.Status(xid)
+	st, err := s.cluster.txn.Status(xid)
 	if err != nil {
 		t.Fatalf("Status(%d): %v", xid, err)
 	}
@@ -1059,7 +1090,7 @@ func txStatus(t *testing.T, s *Session, xid tuple.XID) txn.Status {
 
 func TestImplicitTransactions(t *testing.T) {
 	s := newSession(t)
-	first := s.txn.NextXID()
+	first := s.cluster.txn.NextXID()
 	if first != tuple.FirstNormalXID {
 		t.Fatalf("first XID after bootstrap = %d, want %d", first, tuple.FirstNormalXID)
 	}
@@ -1076,7 +1107,7 @@ func TestImplicitTransactions(t *testing.T) {
 	if s.tx != nil || s.explicit || s.failed {
 		t.Errorf("transaction state after statements: tx %v explicit %v failed %v", s.tx, s.explicit, s.failed)
 	}
-	if got := s.txn.NextXID(); got != first+7 {
+	if got := s.cluster.txn.NextXID(); got != first+7 {
 		t.Errorf("NextXID = %d, want %d", got, first+7)
 	}
 	want := []header{
@@ -1112,7 +1143,7 @@ func TestImplicitTransactions(t *testing.T) {
 	if got := txStatus(t, s, first+8); got != txn.Aborted {
 		t.Errorf("failing statement of the string: %v, want aborted", got)
 	}
-	if got := s.txn.NextXID(); got != first+9 {
+	if got := s.cluster.txn.NextXID(); got != first+9 {
 		t.Errorf("NextXID = %d, want %d", got, first+9)
 	}
 }
@@ -1131,7 +1162,7 @@ func TestTransactionBlock(t *testing.T) {
 	xid := s.tx.XID
 	exec(t, s, "insert into t values (1)")
 	exec(t, s, "insert into t values (2)")
-	if got := s.txn.NextXID(); got != xid+1 {
+	if got := s.cluster.txn.NextXID(); got != xid+1 {
 		t.Errorf("statements in a block allocated XIDs: NextXID = %d, want %d", got, xid+1)
 	}
 	if got := txStatus(t, s, xid); got != txn.InProgress {
@@ -1176,7 +1207,7 @@ func TestTransactionBlock(t *testing.T) {
 
 func TestTransactionWarnings(t *testing.T) {
 	s := newSession(t)
-	next := s.txn.NextXID()
+	next := s.cluster.txn.NextXID()
 	for _, tc := range []struct{ sql, tag, warning string }{
 		{"commit", "COMMIT", WarnNoTransaction},
 		{"rollback", "ROLLBACK", WarnNoTransaction},
@@ -1189,7 +1220,7 @@ func TestTransactionWarnings(t *testing.T) {
 			t.Errorf("%s outside a block changed the state", tc.sql)
 		}
 	}
-	if got := s.txn.NextXID(); got != next {
+	if got := s.cluster.txn.NextXID(); got != next {
 		t.Errorf("COMMIT and ROLLBACK outside a block allocated XIDs: %d, want %d", got, next)
 	}
 
@@ -1250,7 +1281,7 @@ func TestFailedTransaction(t *testing.T) {
 		if _, err := s.Exec("selec 1"); !errors.Is(err, parser.ErrSyntax) {
 			t.Errorf("syntax error in a failed block: %v", err)
 		}
-		if got := s.txn.NextXID(); got != xid+1 {
+		if got := s.cluster.txn.NextXID(); got != xid+1 {
 			t.Errorf("refused statements allocated XIDs: NextXID = %d, want %d", got, xid+1)
 		}
 
@@ -1312,5 +1343,443 @@ func TestTransactionPersistence(t *testing.T) {
 	}
 	if got := headers(t, s, "t"); !reflect.DeepEqual(got, want) {
 		t.Errorf("headers of t:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// Chapter 17: concurrent sessions.
+
+// cluster opens a cluster and n sessions on it.
+func cluster(t *testing.T, n int) (*Cluster, []*Session) {
+	t.Helper()
+	c, err := OpenCluster(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	var ss []*Session
+	for i := 0; i < n; i++ {
+		s, err := c.Connect()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { s.Close() })
+		ss = append(ss, s)
+	}
+	return c, ss
+}
+
+// rows runs a query and renders its rows as FormatDatum values joined
+// by commas, one row per line.
+func rows(t *testing.T, s *Session, sql string) string {
+	t.Helper()
+	r := exec(t, s, sql)
+	var b strings.Builder
+	for _, row := range r.Rows {
+		for i, v := range row {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(FormatDatum(v))
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// errMsg runs a statement that must fail and returns its message.
+func errMsg(t *testing.T, s *Session, sql string) string {
+	t.Helper()
+	_, err := s.Exec(sql)
+	var e *Error
+	if !errors.As(err, &e) {
+		t.Fatalf("Exec(%q): %v, want *Error", sql, err)
+	}
+	return e.Msg
+}
+
+// background runs sql on s in a goroutine and returns the channel its
+// error arrives on.
+func background(s *Session, sql string) chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Exec(sql)
+		done <- err
+	}()
+	return done
+}
+
+// blocked waits until s reports itself blocked, failing if the
+// statement finishes first.
+func blocked(t *testing.T, s *Session, done chan error) {
+	t.Helper()
+	for !s.Blocked() {
+		select {
+		case err := <-done:
+			t.Fatalf("statement did not block: %v", err)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func TestClusterVisibility(t *testing.T) {
+	_, ss := cluster(t, 2)
+	s1, s2 := ss[0], ss[1]
+	exec(t, s1, "create table t (a int4 primary key, b text)")
+	exec(t, s1, "insert into t values (1, 'one')")
+	// An uncommitted insert is visible to its own session only.
+	exec(t, s1, "begin")
+	exec(t, s1, "insert into t values (2, 'two')")
+	if got := rows(t, s1, "select a from t order by a"); got != "1\n2\n" {
+		t.Errorf("own uncommitted insert: %q", got)
+	}
+	if got := rows(t, s2, "select a from t order by a"); got != "1\n" {
+		t.Errorf("other's uncommitted insert: %q", got)
+	}
+	exec(t, s1, "commit")
+	if got := rows(t, s2, "select a from t order by a"); got != "1\n2\n" {
+		t.Errorf("after commit: %q", got)
+	}
+	// A rolled-back delete and update leave the rows as they were, for
+	// both sessions; the tuples are still on the pages.
+	exec(t, s2, "begin")
+	exec(t, s2, "delete from t where a = 1")
+	exec(t, s2, "update t set b = 'zwei' where a = 2")
+	if got := rows(t, s2, "select a, b from t order by a"); got != "2,zwei\n" {
+		t.Errorf("own uncommitted delete and update: %q", got)
+	}
+	if got := rows(t, s1, "select a, b from t order by a"); got != "1,one\n2,two\n" {
+		t.Errorf("other's uncommitted delete and update: %q", got)
+	}
+	exec(t, s2, "rollback")
+	for _, s := range ss {
+		if got := rows(t, s, "select a, b from t order by a"); got != "1,one\n2,two\n" {
+			t.Errorf("after rollback: %q", got)
+		}
+	}
+	if n := len(headers(t, s1, "t")); n != 3 {
+		t.Errorf("%d tuples on the pages, want 3", n)
+	}
+	// Index scans apply the same rule.
+	exec(t, s1, "begin")
+	exec(t, s1, "delete from t where a = 2")
+	if got := rows(t, s2, "select b from t where a = 2"); got != "two\n" {
+		t.Errorf("index scan of a row another session is deleting: %q", got)
+	}
+	exec(t, s1, "rollback")
+	if got := rows(t, s2, "select b from t where a = 2"); got != "two\n" {
+		t.Errorf("index scan after the rollback: %q", got)
+	}
+	// Each statement outside a block sees the latest commits.
+	exec(t, s1, "insert into t values (3, 'three')")
+	if got := rows(t, s2, "select a from t order by a"); got != "1\n2\n3\n" {
+		t.Errorf("after an implicit transaction: %q", got)
+	}
+}
+
+func TestIsolationLevels(t *testing.T) {
+	_, ss := cluster(t, 2)
+	s1, s2 := ss[0], ss[1]
+	exec(t, s1, "create table t (a int4)")
+	exec(t, s1, "insert into t values (1)")
+	// REPEATABLE READ: the snapshot is taken at the first statement and
+	// kept; commits after it stay invisible until the block ends.
+	if r := exec(t, s2, "begin isolation level repeatable read"); r.Tag != "BEGIN" || s2.isolation != ast.RepeatableRead {
+		t.Fatalf("BEGIN ISOLATION LEVEL REPEATABLE READ: %+v, level %v", r, s2.isolation)
+	}
+	exec(t, s1, "insert into t values (2)") // before the first statement: seen
+	if got := rows(t, s2, "select a from t order by a"); got != "1\n2\n" {
+		t.Errorf("first statement of the block: %q", got)
+	}
+	exec(t, s1, "insert into t values (3)")
+	exec(t, s1, "delete from t where a = 1")
+	if got := rows(t, s2, "select a from t order by a"); got != "1\n2\n" {
+		t.Errorf("REPEATABLE READ after other commits: %q", got)
+	}
+	exec(t, s2, "commit")
+	if got := rows(t, s2, "select a from t order by a"); got != "2\n3\n" {
+		t.Errorf("after the block: %q", got)
+	}
+	// READ COMMITTED: every statement takes a new snapshot.
+	for _, begin := range []string{"begin", "begin isolation level read committed", "begin isolation level read uncommitted"} {
+		exec(t, s2, begin)
+		if s2.isolation != ast.ReadCommitted {
+			t.Errorf("%s: level %v", begin, s2.isolation)
+		}
+		before := rows(t, s2, "select a from t order by a")
+		exec(t, s1, "insert into t values (4)")
+		if got := rows(t, s2, "select a from t order by a"); got != before+"4\n" {
+			t.Errorf("%s: after another commit %q, before %q", begin, got, before)
+		}
+		exec(t, s2, "commit")
+		exec(t, s1, "delete from t where a = 4")
+	}
+	// The level and the snapshot are gone with the block.
+	exec(t, s2, "begin isolation level repeatable read")
+	exec(t, s2, "rollback")
+	if s2.isolation != ast.DefaultIsolation || s2.snap != nil {
+		t.Errorf("after ROLLBACK: level %v snapshot %v", s2.isolation, s2.snap)
+	}
+	exec(t, s2, "begin isolation level repeatable read")
+	exec(t, s2, "select 1")
+	if _, err := s2.Exec("select 1/0"); err == nil {
+		t.Fatal("division by zero did not fail")
+	}
+	exec(t, s2, "commit")
+	if s2.snap != nil {
+		t.Error("snapshot kept after a failed block")
+	}
+	// A nested BEGIN cannot change the level.
+	exec(t, s2, "begin")
+	if r := exec(t, s2, "begin isolation level repeatable read"); r.Warnings == nil || s2.isolation != ast.ReadCommitted {
+		t.Errorf("nested BEGIN with a level: %+v, level %v", r, s2.isolation)
+	}
+	exec(t, s2, "commit")
+}
+
+func TestConcurrentUpdates(t *testing.T) {
+	_, ss := cluster(t, 2)
+	s1, s2 := ss[0], ss[1]
+	exec(t, s1, "create table t (a int4 primary key, b int4)")
+	exec(t, s1, "insert into t values (1, 10), (2, 20)")
+	// READ COMMITTED: the second update waits, then works on the
+	// committed new version, so both increments count.
+	exec(t, s1, "begin")
+	exec(t, s1, "update t set b = b + 1 where a = 1")
+	done := background(s2, "update t set b = b + 1 where a = 1")
+	blocked(t, s2, done)
+	exec(t, s1, "commit")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := rows(t, s2, "select b from t where a = 1"); got != "12\n" {
+		t.Errorf("after both updates: %q", got)
+	}
+	// A rollback lets the waiting update through on the original.
+	exec(t, s1, "begin")
+	exec(t, s1, "update t set b = 0 where a = 1")
+	done = background(s2, "update t set b = b + 1 where a = 1")
+	blocked(t, s2, done)
+	exec(t, s1, "rollback")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := rows(t, s2, "select b from t where a = 1"); got != "13\n" {
+		t.Errorf("after the rollback: %q", got)
+	}
+	// A row deleted under the update is skipped: UPDATE 0.
+	exec(t, s1, "begin")
+	exec(t, s1, "delete from t where a = 2")
+	done = background(s2, "update t set b = b + 1 where a = 2")
+	blocked(t, s2, done)
+	exec(t, s1, "commit")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	// The recheck: the row moved out of the WHERE clause is left alone.
+	exec(t, s1, "insert into t values (2, 20)")
+	exec(t, s1, "begin")
+	exec(t, s1, "update t set a = 3 where a = 2")
+	done = background(s2, "update t set b = 99 where a = 2")
+	blocked(t, s2, done)
+	exec(t, s1, "commit")
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if got := rows(t, s2, "select a, b from t order by a"); got != "1,13\n3,20\n" {
+		t.Errorf("after the recheck: %q", got)
+	}
+	// REPEATABLE READ: a concurrent update is a serialization failure
+	// that fails the block.
+	exec(t, s2, "begin isolation level repeatable read")
+	exec(t, s2, "select 1")
+	exec(t, s1, "begin")
+	exec(t, s1, "update t set b = 1 where a = 1")
+	done = background(s2, "update t set b = 2 where a = 1")
+	blocked(t, s2, done)
+	exec(t, s1, "commit")
+	err := <-done
+	var e *Error
+	if !errors.As(err, &e) || !errors.Is(err, executor.ErrSerializationFailure) {
+		t.Fatalf("update under REPEATABLE READ: %v", err)
+	}
+	if e.Msg != "could not serialize access due to concurrent update" || !s2.failed {
+		t.Errorf("message %q, failed %v", e.Msg, s2.failed)
+	}
+	if r := exec(t, s2, "commit"); r.Tag != "ROLLBACK" {
+		t.Errorf("COMMIT of the failed block: %+v", r)
+	}
+	if got := rows(t, s2, "select b from t where a = 1"); got != "1\n" {
+		t.Errorf("after the serialization failure: %q", got)
+	}
+}
+
+func TestUniqueAcrossSessions(t *testing.T) {
+	_, ss := cluster(t, 2)
+	s1, s2 := ss[0], ss[1]
+	exec(t, s1, "create table t (a int4 primary key)")
+	// The second insert of a key waits for the first's verdict: a
+	// commit makes it a violation, a rollback lets it through.
+	exec(t, s1, "begin")
+	exec(t, s1, "insert into t values (1)")
+	done := background(s2, "insert into t values (1)")
+	blocked(t, s2, done)
+	exec(t, s1, "commit")
+	err := <-done
+	if !errors.Is(err, index.ErrUniqueViolation) {
+		t.Fatalf("insert after the holder committed: %v", err)
+	}
+	exec(t, s1, "begin")
+	exec(t, s1, "insert into t values (2)")
+	done = background(s2, "insert into t values (2)")
+	blocked(t, s2, done)
+	exec(t, s1, "rollback")
+	if err := <-done; err != nil {
+		t.Fatalf("insert after the holder rolled back: %v", err)
+	}
+	if got := rows(t, s1, "select a from t order by a"); got != "1\n2\n" {
+		t.Errorf("rows: %q", got)
+	}
+	// A key whose row another session is deleting is free once the
+	// delete commits.
+	exec(t, s1, "begin")
+	exec(t, s1, "delete from t where a = 1")
+	done = background(s2, "insert into t values (1)")
+	blocked(t, s2, done)
+	exec(t, s1, "commit")
+	if err := <-done; err != nil {
+		t.Fatalf("insert after the delete committed: %v", err)
+	}
+}
+
+// TestUniqueUnderConcurrentInsert races two sessions inserting the same
+// key with nothing between them: both pass the check before either
+// writes, so only the lock the index write is under can decide.
+func TestUniqueUnderConcurrentInsert(t *testing.T) {
+	const rounds = 50
+	_, ss := cluster(t, 2)
+	exec(t, ss[0], "create table t (a int4 primary key)")
+	var want strings.Builder
+	for i := 0; i < rounds; i++ {
+		sql := fmt.Sprintf("insert into t values (%d)", i)
+		var wg sync.WaitGroup
+		errs := make([]error, len(ss))
+		for j, s := range ss {
+			wg.Add(1)
+			go func(j int, s *Session) {
+				defer wg.Done()
+				_, errs[j] = s.Exec(sql)
+			}(j, s)
+		}
+		wg.Wait()
+		ok := 0
+		for _, err := range errs {
+			switch {
+			case err == nil:
+				ok++
+			case !errors.Is(err, index.ErrUniqueViolation):
+				t.Fatalf("round %d: %v", i, err)
+			}
+		}
+		if ok != 1 {
+			t.Fatalf("round %d: %d of %d inserts of the same key succeeded, want 1", i, ok, len(ss))
+		}
+		fmt.Fprintf(&want, "%d\n", i)
+	}
+	if got := rows(t, ss[0], "select a from t order by a"); got != want.String() {
+		t.Errorf("rows after %d rounds:\n%s", rounds, got)
+	}
+}
+
+func TestCatalogAcrossSessions(t *testing.T) {
+	_, ss := cluster(t, 2)
+	s1, s2 := ss[0], ss[1]
+	// Uncommitted DDL is invisible to the other session; committed DDL
+	// is seen at once, inside a REPEATABLE READ block too.
+	exec(t, s2, "begin isolation level repeatable read")
+	exec(t, s2, "select 1")
+	exec(t, s1, "begin")
+	exec(t, s1, "create table t (a int4)")
+	exec(t, s1, "insert into t values (1)")
+	if got := errMsg(t, s2, "select * from t"); got != `relation "t" does not exist` {
+		t.Errorf("uncommitted table: %q", got)
+	}
+	exec(t, s2, "rollback")
+	exec(t, s2, "begin isolation level repeatable read")
+	exec(t, s2, "select 1")
+	exec(t, s1, "commit")
+	if got := rows(t, s2, "select a from t"); got != "" {
+		t.Errorf("rows of a table created after the snapshot: %q", got)
+	}
+	exec(t, s2, "commit")
+	if got := rows(t, s2, "select a from t"); got != "1\n" {
+		t.Errorf("after the commit: %q", got)
+	}
+	// A rolled-back DROP TABLE leaves the table and its file; a
+	// rolled-back CREATE TABLE leaves nothing, and the name is free.
+	exec(t, s1, "begin")
+	exec(t, s1, "drop table t")
+	if got := errMsg(t, s1, "select * from t"); got != `relation "t" does not exist` {
+		t.Errorf("own dropped table: %q", got)
+	}
+	exec(t, s1, "rollback")
+	for _, s := range ss {
+		if got := rows(t, s, "select a from t"); got != "1\n" {
+			t.Errorf("after the rolled-back drop: %q", got)
+		}
+	}
+	exec(t, s1, "begin")
+	exec(t, s1, "create table u (a int4 primary key)")
+	exec(t, s1, "insert into u values (1)")
+	exec(t, s1, "rollback")
+	if got := errMsg(t, s2, "select * from u"); got != `relation "u" does not exist` {
+		t.Errorf("rolled-back table: %q", got)
+	}
+	exec(t, s2, "create table u (a int4)")
+	exec(t, s2, "insert into u values (2)")
+	if got := rows(t, s1, "select a from u"); got != "2\n" {
+		t.Errorf("table recreated after a rollback: %q", got)
+	}
+	// Indexes created by another session are used by the next statement.
+	exec(t, s1, "create index u_a on u (a)")
+	exec(t, s2, "insert into u values (3)")
+	if got := rows(t, s2, "select a from u where a = 3"); got != "3\n" {
+		t.Errorf("index scan after another session's CREATE INDEX: %q", got)
+	}
+	// \d outside a transaction works, and after the other's commit.
+	if r, err := s2.Describe("u"); err != nil || len(r.Footer) != 2 {
+		t.Errorf("Describe(u) = %+v, %v", r, err)
+	}
+}
+
+func TestClusterClose(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	c, err := OpenCluster(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s1, _ := c.Connect()
+	s2, _ := c.Connect()
+	exec(t, s1, "create table t (a int4)")
+	exec(t, s1, "begin")
+	exec(t, s1, "insert into t values (1)")
+	exec(t, s2, "insert into t values (2)")
+	// A session's Close aborts its transaction; the cluster stays open
+	// for the others until its own Close.
+	if err := s1.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rows(t, s2, "select a from t"); got != "2\n" {
+		t.Errorf("after the other session closed: %q", got)
+	}
+	if err := s2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := open(t, dir)
+	if got := rows(t, s, "select a from t"); got != "2\n" {
+		t.Errorf("after reopen: %q", got)
 	}
 }

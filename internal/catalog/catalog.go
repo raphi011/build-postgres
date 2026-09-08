@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/raphi011/build-postgres/internal/bufmgr"
+	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
 
@@ -110,8 +111,24 @@ type IndexInfo struct {
 // Catalog gives access to the system catalogs of one data directory. It is
 // safe for concurrent use.
 type Catalog struct {
-	pool *bufmgr.Pool
-	mu   sync.Mutex
+	pool  *bufmgr.Pool
+	class *heap.Relation
+	attr  *heap.Relation
+	index *heap.Relation
+
+	mu    sync.Mutex
+	cache map[string]*RelationInfo // relation cache by name
+
+	snapshot func() heap.Snapshot // nil until SetSnapshot (chapter 17)
+	pending  []pendingFile        // files to unlink when the transaction ends
+}
+
+// pendingFile is a relation file created or dropped by the current
+// transaction: a created one goes at abort, a dropped one at commit.
+// PostgreSQL: PendingRelDelete in storage.c.
+type pendingFile struct {
+	oid      tuple.OID
+	atCommit bool
 }
 
 // Bootstrap initialises an empty data directory: it writes the control
@@ -145,21 +162,23 @@ func (c *Catalog) NewOID() (tuple.OID, error) {
 }
 
 // CreateTable creates the relation file for a new table and records it in
-// the catalogs, stamping the catalog rows with xid. Returns
-// ErrTooManyColumns for more than MaxColumns columns; ErrDuplicateColumn
-// if two columns share a name; ErrExists if name is already in pg_class
-// (catalogs included). All three are checked before any OID is allocated
-// or any row written. Does not flush.
+// the catalogs, stamping the catalog rows with xid. The file is removed
+// again by EndTransaction(false). Returns ErrTooManyColumns for more than
+// MaxColumns columns; ErrDuplicateColumn if two columns share a name;
+// ErrExists if name is already in pg_class (catalogs included). All three
+// are checked before any OID is allocated or any row written. Does not
+// flush.
 // PostgreSQL: heap_create_with_catalog in heap.c.
 func (c *Catalog) CreateTable(name string, desc *tuple.Desc, xid tuple.XID) (tuple.OID, error) {
 	panic("not implemented")
 }
 
-// DropTable deletes a table's catalog rows, stamping them with xid, and
-// removes its relation file; the table's indexes are dropped with it.
-// Returns ErrNotFound for an unknown name; ErrWrongObjectType if name is
-// an index; ErrSystemTable for a relation with an OID below FirstUserOID.
-// Does not flush.
+// DropTable deletes a table's catalog rows, stamping them with xid; the
+// table's indexes are dropped with it. The relation files stay until
+// EndTransaction(true) removes them, so that a rolled-back drop loses
+// nothing. Returns ErrNotFound for an unknown name; ErrWrongObjectType
+// if name is an index; ErrSystemTable for a relation with an OID below
+// FirstUserOID. Does not flush.
 // PostgreSQL: heap_drop_with_catalog in heap.c.
 func (c *Catalog) DropTable(name string, xid tuple.XID) error {
 	panic("not implemented")
@@ -190,7 +209,8 @@ func (c *Catalog) Tables() ([]*RelationInfo, error) {
 
 // CreateIndex creates an empty B-tree over column attr (0-based) of the
 // table rel, named name, and records it in pg_class (relkind i, no
-// pg_attribute rows) and pg_index, stamping the rows with xid. Returns
+// pg_attribute rows) and pg_index, stamping the rows with xid. The file
+// is removed again by EndTransaction(false). Returns
 // ErrNotFound if rel is not in pg_class; ErrWrongObjectType if it is not
 // a table; ErrSystemTable if it is a catalog; ErrExists if name is
 // already in pg_class. All are checked before any OID is allocated or
@@ -201,8 +221,8 @@ func (c *Catalog) CreateIndex(name string, rel tuple.OID, attr int, unique, prim
 }
 
 // DropIndex deletes an index's pg_class and pg_index rows, stamping them
-// with xid, and removes its relation file. Returns ErrNotFound for an
-// unknown name; ErrWrongObjectType if name is not an index;
+// with xid; the file goes with EndTransaction(true). Returns ErrNotFound
+// for an unknown name; ErrWrongObjectType if name is not an index;
 // ErrDependentObjects for a primary key index, which only DropTable
 // removes. Does not flush.
 // PostgreSQL: index_drop in index.c.
@@ -222,5 +242,33 @@ func (c *Catalog) LookupIndex(name string) (*IndexInfo, error) {
 // xid. Returns ErrNotFound for an unknown OID. Does not flush.
 // PostgreSQL: vac_update_relstats in vacuum.c.
 func (c *Catalog) UpdateStats(oid tuple.OID, pages int32, tuples int64, xid tuple.XID) error {
+	panic("not implemented")
+}
+
+// SetSnapshot makes every catalog read take its snapshot from fn, which
+// is called at the start of each scan of a catalog and for each catalog
+// row deleted or updated. Until it is called the catalog reads with a
+// nil snapshot, the rule of chapters 8 to 16. The relation cache is
+// dropped, since what it holds was read under the old rule.
+// PostgreSQL: GetCatalogSnapshot in snapmgr.c.
+func (c *Catalog) SetSnapshot(fn func() heap.Snapshot) {
+	panic("not implemented")
+}
+
+// EndTransaction finishes the file work of the transaction that made
+// this catalog's changes: on commit it removes the files of the
+// relations it dropped, on abort those of the relations it created,
+// discarding their buffers first. Either way the pending list is
+// cleared and the cache dropped. Returns the first Unlink error.
+// PostgreSQL: smgrDoPendingDeletes in storage.c.
+func (c *Catalog) EndTransaction(commit bool) error {
+	panic("not implemented")
+}
+
+// Invalidate drops the relation cache, so that the next Lookup reads
+// what other sessions have committed since. A session calls it at the
+// start of every statement.
+// PostgreSQL: AcceptInvalidationMessages in inval.c.
+func (c *Catalog) Invalidate() {
 	panic("not implemented")
 }

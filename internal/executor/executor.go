@@ -8,14 +8,17 @@ import (
 
 	"github.com/raphi011/build-postgres/internal/bufmgr"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
+	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/plan"
+	"github.com/raphi011/build-postgres/internal/sql/ast"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
 
 // Sentinel errors, one per PostgreSQL error class raised at execution.
 var (
-	ErrNotNull         = errors.New("not-null violation") // 23502
-	ErrInvalidRowCount = errors.New("invalid row count")  // 2201W
+	ErrNotNull              = errors.New("not-null violation")    // 23502
+	ErrInvalidRowCount      = errors.New("invalid row count")     // 2201W
+	ErrSerializationFailure = errors.New("serialization failure") // 40001
 )
 
 // Error is an execution error with PostgreSQL's message text.
@@ -52,10 +55,16 @@ type Node interface {
 	Close() error
 }
 
-// Env is what nodes need from their surroundings.
+// Env is what nodes need from their surroundings: the pool, the
+// transaction's ID for the tuples it writes, the snapshot its scans
+// read with (nil for the rule of chapters 11 to 16: every tuple whose
+// xmax is zero), and the isolation level, which decides what an UPDATE
+// or DELETE does with a row another transaction changed first.
 type Env struct {
-	Pool *bufmgr.Pool
-	XID  tuple.XID
+	Pool      *bufmgr.Pool
+	XID       tuple.XID
+	Snapshot  heap.Snapshot
+	Isolation ast.Isolation
 }
 
 // Build turns a plan tree into an executor tree. It does no I/O. Panics

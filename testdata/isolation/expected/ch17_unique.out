@@ -1,0 +1,57 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1i s2i s1c s2s
+step s1b: BEGIN;
+step s1i: INSERT INTO t VALUES (2);
+step s2i: INSERT INTO t VALUES (2); <waiting ...>
+step s1c: COMMIT;
+step s2i: <... completed>
+ERROR:  duplicate key value violates unique constraint "t_pkey"
+step s2s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+2
+(2 rows)
+
+
+starting permutation: s1b s1i s2i s1r s2s
+step s1b: BEGIN;
+step s1i: INSERT INTO t VALUES (2);
+step s2i: INSERT INTO t VALUES (2); <waiting ...>
+step s1r: ROLLBACK;
+step s2i: <... completed>
+step s2s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+2
+(2 rows)
+
+
+starting permutation: s1b s1d s2i1 s1c s2s
+step s1b: BEGIN;
+step s1d: DELETE FROM t WHERE a = 1;
+step s2i1: INSERT INTO t VALUES (1); <waiting ...>
+step s1c: COMMIT;
+step s2i1: <... completed>
+step s2s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+(1 row)
+
+
+starting permutation: s1b s1d s2i1 s1r s2s
+step s1b: BEGIN;
+step s1d: DELETE FROM t WHERE a = 1;
+step s2i1: INSERT INTO t VALUES (1); <waiting ...>
+step s1r: ROLLBACK;
+step s2i1: <... completed>
+ERROR:  duplicate key value violates unique constraint "t_pkey"
+step s2s: SELECT a FROM t ORDER BY a;
+a
+-
+1
+(1 row)
+

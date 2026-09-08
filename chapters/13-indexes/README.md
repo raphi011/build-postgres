@@ -417,10 +417,10 @@ var ErrUniqueViolation, ErrTooLarge error // 23505, 54000
 type Error struct { Err error; Msg string }
 
 func Open(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo) *btree.Tree
-func Check(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID) error
-func CheckUnique(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID) error
-func Insert(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, tid tuple.TID) error
-func Build(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo) error
+func Check(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID, snap heap.Snapshot) error
+func CheckUnique(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID, snap heap.Snapshot) error
+func Insert(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, tid, except tuple.TID, snap heap.Snapshot) error
+func Build(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo, snap heap.Snapshot) error
 ```
 
 `internal/plan`
@@ -465,12 +465,21 @@ Semantics the tests depend on:
   and NULLs do not count as duplicates; `Insert` on a table without
   indexes does nothing; entries are in `(key, TID)` order and `Check`
   passes after every operation.
+- The `snap` argument of `Check`, `CheckUnique`, and `Build` is chapter
+  17's; this chapter's tests pass nil, under which a tuple is live while
+  its `xmax` is zero.
 - `CheckUnique` conflicts only with a live tuple other than `except`;
   never on a NULL key, a non-unique index, or a table without indexes;
   it writes nothing. `Check` runs it after refusing any key whose index
   tuple (8-byte header, the key's encoding from chapter 12) would exceed
   `btree.MaxItemSize`, naming the size and the index; a NULL key is never
   too large; `Build` over such a value fails the same way.
+- `Insert` runs the unique check again, under a lock it also holds for
+  its writes, and returns `CheckUnique`'s violation if the key appeared
+  in between. Without that, two transactions can both pass `Check` and
+  both write the key; the isolation harness cannot catch it, because it
+  runs one step at a time, but session `TestUniqueUnderConcurrentInsert`
+  does.
 - Executor: after INSERT the TIDs in each index equal the table's live
   TIDs sorted by that column (NULLs last, ties by TID); after UPDATE the
   index holds the old entries too, pointing at tuples with a non-zero
@@ -548,8 +557,9 @@ desc.Attrs[attr].Type)`, `insertClass` with kind `i` (give it a kind
 parameter), a `pg_index` row through `tuple.Form(IndexDesc, ...)`,
 `invalidate`. `DropIndex`: `findClassTID` by name, the kind check, find the
 `pg_index` row's TID and `Primary` flag with a private `findIndexTID(oid)`,
-the dependency check, delete both rows, `invalidate`, `Discard`,
-`Unlink`. `DropTable` calls the same private drop for each row `findIndexTIDs(info.OID)` returns before dropping the
+the dependency check, delete both rows, `invalidate`, and the file onto the
+list `EndTransaction(true)` unlinks. `DropTable` calls the same private
+drop for each row `findIndexTIDs(info.OID)` returns before dropping the
 table, and refuses `Kind == RelKindIndex` first. Bootstrap adds `pg_index`
 to its two loops and `newCatalog` opens it.
 </details>
@@ -561,7 +571,7 @@ to its two loops and `newCatalog` opens it.
 
 <details><summary><b>index.Build.</b></summary>
 
-`heap.Open(pool, rel.OID, rel.Desc).Scan()`; per tuple `Deform`, take
+`heap.Open(pool, rel.OID, rel.Desc).Scan(snap)`; per tuple `Deform`, take
 `vals[idx.Attr]` (nil when `nulls[idx.Attr]`), and for a unique index keep
 a `map[tuple.Datum]bool` of non-NULL keys seen: a repeat is the `could not
 create unique index` error before any further insert. Then
@@ -570,15 +580,27 @@ create unique index` error before any further insert. Then
 
 <details><summary><b>index.Insert</b></summary>
 
-`index.Insert` loops over `rel.Indexes`, opens each, and inserts the row's key or nil.
+`index.Insert` loops over `rel.Indexes`, opens each, and inserts the row's
+key or nil — under the relation's insert lock, and after repeating
+`CheckUnique` there. The lock is a package-level `map[tuple.OID]*sync.Mutex`
+behind its own mutex, one entry per relation for the life of the process.
+The loop is: take the lock, run the unique check, and if it says to wait,
+drop the lock, wait, and start over; on a conflict drop the lock and
+return the violation; otherwise write every entry and drop the lock. The
+wait must not happen with the lock held — the transaction being waited
+for may want the same lock to finish its own insert — and the heap write
+must stay outside it for the same reason.
 </details>
 
 <details><summary><b>index.CheckUnique.</b></summary>
 
 For each index with `Unique` and a non-NULL key: `tree.Scan(&Bound{key,
 true}, &Bound{key, true})`; for each entry whose `TID() != except`,
-`heap.Fetch` and test `Xmax() == 0`; the first live one is
-the violation. Close the scan on every path.
+`heap.Fetch(tid, snap)` and test the visible flag; the first live one is
+the violation. Close the scan on every path. Split the scan out into a
+private helper that reports the conflict, or the transaction to wait for,
+without waiting itself: `CheckUnique` waits around it, and `Insert` needs
+the same helper without the wait, because it holds a lock.
 </details>
 
 <details><summary><b>index.Check.</b></summary>
@@ -607,7 +629,7 @@ the design section says. `Next`: `false` when `none`; `scan.Next()`; if
 `write` for Insert and Update becomes: `form` (the NOT NULL check first, as
 before), `index.Check(pool, rel, vals, nulls, except)` with `except` the
 old TID for Update and the zero TID for Insert, the heap write, then
-`index.Insert` with the new TID. Delete is unchanged. Use `n.rel.Rel` for
+`index.Insert` with the new TID and the same `except`. Delete is unchanged. Use `n.rel.Rel` for
 the relation: the session refreshed it after every DDL, so its `Indexes`
 are current.
 </details>

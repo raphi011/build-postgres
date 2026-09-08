@@ -9,6 +9,7 @@ import (
 	"github.com/raphi011/build-postgres/internal/btree"
 	"github.com/raphi011/build-postgres/internal/bufmgr"
 	"github.com/raphi011/build-postgres/internal/catalog"
+	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
 
@@ -35,15 +36,17 @@ func Open(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo) 
 }
 
 // Check verifies that a row with values vals (nulls marking NULLs) can
-// be indexed in every index of rel, so that Insert cannot fail after the
-// heap tuple is written: every key forms an index tuple no larger than
-// btree.MaxItemSize, and CheckUnique passes. A key too large is a *Error
-// wrapping ErrTooLarge with the message `index row size N exceeds btree
-// version 4 maximum 2704 for index "name"`, N being the tuple's size.
-// Nothing is written.
+// be indexed in every index of rel, so that the usual violation is
+// reported before the heap tuple is written: every key forms an index
+// tuple no larger than btree.MaxItemSize, and CheckUnique passes under
+// snap. A key too large is a *Error wrapping ErrTooLarge with the message
+// `index row size N exceeds btree version 4 maximum 2704 for index
+// "name"`, N being the tuple's size. Nothing is written. Insert repeats
+// the unique half of the check under a lock, because nothing stops
+// another transaction from writing the key between the two.
 // PostgreSQL: _bt_check_third_page in nbtutils.c, ExecInsertIndexTuples
 // in execIndexing.c.
-func Check(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID) error {
+func Check(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID, snap heap.Snapshot) error {
 	panic("not implemented")
 }
 
@@ -51,29 +54,49 @@ func Check(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nul
 // can be stored in rel without violating a unique index: for every
 // unique index of rel, no live heap tuple other than the one at except
 // (the zero TID for an insert, the old version for an update) has the
-// same key. A NULL key never conflicts. Returns a *Error wrapping
+// same key. Live is what snap's Dirty reports: a tuple another running
+// transaction inserted or deleted makes the check wait for that
+// transaction and look again. A NULL key never conflicts. With a nil
+// snap a tuple is live while its xmax is zero. Returns a *Error wrapping
 // ErrUniqueViolation with the message
 // `duplicate key value violates unique constraint "name"`.
 // PostgreSQL: _bt_check_unique in nbtinsert.c.
-func CheckUnique(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID) error {
+func CheckUnique(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, except tuple.TID, snap heap.Snapshot) error {
 	panic("not implemented")
 }
 
 // Insert adds an entry pointing at tid to every index of rel for the row
-// vals; a NULL key is indexed as NULL. Nothing is checked: call Check
-// before writing the heap tuple.
-// PostgreSQL: ExecInsertIndexTuples in execIndexing.c.
-func Insert(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, tid tuple.TID) error {
+// vals; a NULL key is indexed as NULL. It holds rel's insert lock across
+// a repeat of CheckUnique and the writes, so that the last look at a
+// unique index and the entry that answers it are one critical section:
+// two transactions that both pass Check cannot then both write the key.
+// except is what it was for Check, the zero TID for an insert and the old
+// version for an update. A conflict found here is CheckUnique's *Error,
+// and the heap tuple the caller has already written is left for the
+// transaction's abort to bury. A wait for another transaction happens
+// with the lock released.
+// PostgreSQL: ExecInsertIndexTuples in execIndexing.c, over a
+// _bt_doinsert that holds the leaf page's write lock across
+// _bt_check_unique.
+func Insert(pool *bufmgr.Pool, rel *catalog.RelationInfo, vals []tuple.Datum, nulls []bool, tid, except tuple.TID, snap heap.Snapshot) error {
 	panic("not implemented")
 }
 
-// Build fills the empty index idx from every visible tuple of rel, in
-// heap order. For a unique index two tuples with the same non-NULL key
-// stop the build with a *Error wrapping ErrUniqueViolation and the
-// message `could not create unique index "name"`; a key too large stops
-// it with the ErrTooLarge error of Check. The entries inserted so far
-// stay in the file, and the caller drops the index.
-// PostgreSQL: index_build and _bt_load in nbtsort.c.
-func Build(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo) error {
+// Build fills the empty index idx from the tuples of rel, in heap
+// order: every version some snapshot may still see, which is all of
+// them but those whose inserting transaction aborted, so a deleted
+// tuple is indexed too, and one a running transaction is inserting or
+// deleting. For a unique index two live tuples (committed and not
+// deleted, as snap's Dirty reports) with the same non-NULL key stop the
+// build with a *Error wrapping ErrUniqueViolation and the message
+// `could not create unique index "name"`; to know whether a tuple a
+// running transaction is inserting or deleting counts, the build waits
+// for that transaction. A key too large stops it with the ErrTooLarge
+// error of Check. With a nil snap the tuples whose xmax is zero are
+// indexed and all count as live. The entries inserted so far stay in
+// the file, and the caller drops the index.
+// PostgreSQL: heapam_index_build_range_scan in heapam_handler.c,
+// _bt_load in nbtsort.c.
+func Build(pool *bufmgr.Pool, rel *catalog.RelationInfo, idx *catalog.IndexInfo, snap heap.Snapshot) error {
 	panic("not implemented")
 }

@@ -326,10 +326,11 @@ Semantics the tests depend on:
   `ErrDuplicateColumn`; all three are checked before anything is
   allocated or written. A table with no columns is allowed, and one with
   exactly `MaxColumns` is too.
-- `DropTable` deletes the rows, unlinks the file, and discards the pool's
-  pages for it. Unknown name is `ErrNotFound`; a catalog is
-  `ErrSystemTable`. The name is free for reuse immediately; the new table
-  gets a new OID.
+- `DropTable` deletes the rows and records the file for removal:
+  `EndTransaction(true)`, chapter 17's commit hook, discards the pool's
+  pages for it and unlinks it, and the tests call it right after the
+  drop. Unknown name is `ErrNotFound`; a catalog is `ErrSystemTable`.
+  The name is free for reuse immediately; the new table gets a new OID.
 - `Lookup` and `LookupOID` return `ErrNotFound` for unknown or dropped
   tables and a `RelationInfo` whose `Desc` equals the one passed to
   `CreateTable` (names, types, `NotNull`). `Lookup` of a catalog returns
@@ -500,11 +501,14 @@ Order matters; `TestCreateTableErrors` expects the next OID to be
 Lock, `findClassTID` by name (`ErrNotFound` propagates), then `info.OID <
 FirstUserOID` is `ErrSystemTable`, checked before any write.
 `class.Delete(tid, xid)`, then `scanAttributes(info.OID)` and `attr.Delete`
-each TID, then `invalidate`, `pool.Discard(info.OID)`, and
-`Store().Unlink(info.OID)`. Discard before unlink: a dirty page of the
-dropped relation flushed later would hit `smgr.ErrNotFound`. `heap.Delete`
-leaves the row in place; `TestDropTable` fetches it at `{0, 3}` and expects
-`xmax` 20.
+each TID, then `invalidate`, and append the OID to a private list of files
+to remove at commit. **EndTransaction** walks that list:
+`pool.Discard(oid)`, then `Store().Unlink(oid)`. Discard before unlink: a
+dirty page of the dropped relation flushed later would hit
+`smgr.ErrNotFound`. Files `CreateTable` made go on the same list marked for
+removal at abort; `EndTransaction(false)` takes those. `heap.Delete` leaves
+the row in place; `TestDropTable` fetches it at `{0, 3}` and expects `xmax`
+20.
 </details>
 
 ## Suggested order

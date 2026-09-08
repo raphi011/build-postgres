@@ -1,0 +1,123 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1b s1u s2b s2u s1c s2s s2c
+step s1b: BEGIN;
+step s1u: UPDATE t SET b = b + 1 WHERE a = 1;
+step s2b: BEGIN;
+step s2u: UPDATE t SET b = b + 1 WHERE a = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+1|12
+2|20
+(2 rows)
+
+step s2c: COMMIT;
+
+starting permutation: s1b s1u s2b s2u s1r s2s s2c
+step s1b: BEGIN;
+step s1u: UPDATE t SET b = b + 1 WHERE a = 1;
+step s2b: BEGIN;
+step s2u: UPDATE t SET b = b + 1 WHERE a = 1; <waiting ...>
+step s1r: ROLLBACK;
+step s2u: <... completed>
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+1|11
+2|20
+(2 rows)
+
+step s2c: COMMIT;
+
+starting permutation: s1b s1d s2b s2u s1c s2s s2c
+step s1b: BEGIN;
+step s1d: DELETE FROM t WHERE a = 1;
+step s2b: BEGIN;
+step s2u: UPDATE t SET b = b + 1 WHERE a = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+2|20
+(1 row)
+
+step s2c: COMMIT;
+
+starting permutation: s1b s1m s2b s2u s1c s2s s2c
+step s1b: BEGIN;
+step s1m: UPDATE t SET a = 3 WHERE a = 1;
+step s2b: BEGIN;
+step s2u: UPDATE t SET b = b + 1 WHERE a = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+2|20
+3|10
+(2 rows)
+
+step s2c: COMMIT;
+
+starting permutation: s2rr s2s s1b s1u s2u s1c s2c
+step s2rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+1|10
+2|20
+(2 rows)
+
+step s1b: BEGIN;
+step s1u: UPDATE t SET b = b + 1 WHERE a = 1;
+step s2u: UPDATE t SET b = b + 1 WHERE a = 1; <waiting ...>
+step s1c: COMMIT;
+step s2u: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2c: COMMIT;
+
+starting permutation: s2rr s2s s1b s1d s2d s1c s2c
+step s2rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+1|10
+2|20
+(2 rows)
+
+step s1b: BEGIN;
+step s1d: DELETE FROM t WHERE a = 1;
+step s2d: DELETE FROM t WHERE a = 1; <waiting ...>
+step s1c: COMMIT;
+step s2d: <... completed>
+ERROR:  could not serialize access due to concurrent update
+step s2c: COMMIT;
+
+starting permutation: s2rr s2s s1d s2s s2c s2s
+step s2rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+1|10
+2|20
+(2 rows)
+
+step s1d: DELETE FROM t WHERE a = 1;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+1|10
+2|20
+(2 rows)
+
+step s2c: COMMIT;
+step s2s: SELECT * FROM t ORDER BY a;
+a|b 
+-+--
+2|20
+(1 row)
+

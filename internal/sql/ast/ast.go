@@ -126,8 +126,26 @@ type Delete struct {
 	Where Expr
 }
 
-// Begin is BEGIN.
-type Begin struct{}
+// Begin is BEGIN [ISOLATION LEVEL level].
+type Begin struct {
+	Isolation Isolation
+}
+
+// Isolation is a transaction isolation level. READ UNCOMMITTED parses
+// as READ COMMITTED, which is how PostgreSQL treats it.
+type Isolation int
+
+const (
+	// DefaultIsolation is BEGIN without a level: the session's default,
+	// READ COMMITTED.
+	DefaultIsolation Isolation = iota
+	ReadCommitted
+	RepeatableRead
+)
+
+func (i Isolation) String() string {
+	panic("not implemented")
+}
 
 // Commit is COMMIT.
 type Commit struct{}
@@ -295,7 +313,7 @@ func (t *TableRef) String() string    { panic("not implemented") }
 func (j *Join) String() string        { panic("not implemented") }
 func (s *Update) String() string      { panic("not implemented") }
 func (s *Delete) String() string      { panic("not implemented") }
-func (*Begin) String() string         { panic("not implemented") }
+func (b *Begin) String() string       { panic("not implemented") }
 func (*Commit) String() string        { panic("not implemented") }
 func (*Rollback) String() string      { panic("not implemented") }
 func (s *Explain) String() string     { panic("not implemented") }

@@ -135,3 +135,31 @@ func (t *Transaction) Abort() error {
 func (m *Manager) Status(xid tuple.XID) (Status, error) {
 	panic("not implemented")
 }
+
+// Chapter 17: snapshots and transaction waits.
+
+// Snapshot returns what a snapshot needs from the running set: xmin is
+// the oldest running transaction ID (the next ID if none is running),
+// xmax the next ID to be handed out, and xip the running IDs in
+// ascending order. Every ID below xmin has finished; every ID at or
+// above xmax had not started. The three are read under one lock, so
+// they agree with each other.
+// PostgreSQL: GetSnapshotData in procarray.c.
+func (m *Manager) Snapshot() (xmin, xmax tuple.XID, xip []tuple.XID) {
+	panic("not implemented")
+}
+
+// Wait blocks until the transaction xid has committed or aborted, or the
+// manager is closed. It returns at once for an ID that is not running.
+// PostgreSQL: XactLockTableWait in lmgr.c.
+func (m *Manager) Wait(xid tuple.XID) {
+	panic("not implemented")
+}
+
+// Waiting returns the number of goroutines blocked in Wait. The
+// isolation test runner uses it to tell a step that blocks on another
+// session from one that is still running.
+// PostgreSQL: pg_isolation_test_session_is_blocked in regress.c.
+func (m *Manager) Waiting() int {
+	panic("not implemented")
+}
