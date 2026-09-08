@@ -160,3 +160,15 @@ func (p Page) DeleteItem(n OffsetNumber) error {
 func (p Page) Compact() {
 	panic("not implemented")
 }
+
+// InsertItem stores item as item n, moving the line pointers of items n
+// and above up by one; n may be NumItems()+1. Unlike AddItem it never
+// reuses an unused line pointer. Added by chapter 12 for B-tree pages,
+// whose items are kept in key order (PageAddItem with an offset number).
+// Returns ErrItemTooLarge if len(item) > MaxItemSize; ErrInvalidOffset if
+// n is outside 1..NumItems()+1; ErrNoSpace if the 8-aligned item plus a
+// new line pointer does not fit.
+// PostgreSQL: PageAddItemExtended in bufpage.c.
+func (p Page) InsertItem(n OffsetNumber, item []byte) error {
+	panic("not implemented")
+}
