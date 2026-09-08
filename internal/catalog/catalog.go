@@ -4,9 +4,11 @@ package catalog
 
 import (
 	"errors"
+	"sort"
 	"sync"
 
 	"github.com/raphi011/build-postgres/internal/bufmgr"
+	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
 
@@ -73,11 +75,32 @@ type RelationInfo struct {
 	Desc   *tuple.Desc
 }
 
+// Control is the content of <datadir>/global/control.
+type Control struct {
+	NextOID tuple.OID
+	NextXID tuple.XID
+}
+
 // Catalog gives access to the system catalogs of one data directory. It is
 // safe for concurrent use.
 type Catalog struct {
-	pool *bufmgr.Pool
-	mu   sync.Mutex
+	pool  *bufmgr.Pool
+	class *heap.Relation
+	attr  *heap.Relation
+
+	mu      sync.Mutex
+	control Control
+	cache   map[string]*RelationInfo // relation cache by name
+}
+
+func newCatalog(pool *bufmgr.Pool, ctl Control) *Catalog {
+	return &Catalog{
+		pool:    pool,
+		class:   heap.Open(pool, ClassOID, ClassDesc),
+		attr:    heap.Open(pool, AttributeOID, AttributeDesc),
+		control: ctl,
+		cache:   map[string]*RelationInfo{},
+	}
 }
 
 // Bootstrap initialises an empty data directory: it writes the control
@@ -87,7 +110,42 @@ type Catalog struct {
 // exists, ErrControlCorrupt if one exists but is unreadable.
 // PostgreSQL: BootstrapModeMain in bootstrap.c.
 func Bootstrap(pool *bufmgr.Pool) (*Catalog, error) {
-	panic("not implemented")
+	dir := pool.Store().Path()
+	if _, err := ReadControl(dir); !errors.Is(err, ErrNotBootstrapped) {
+		if err == nil {
+			return nil, ErrBootstrapped
+		}
+		return nil, err
+	}
+	ctl := Control{NextOID: FirstUserOID, NextXID: tuple.FirstNormalXID}
+	if err := WriteControl(dir, ctl); err != nil {
+		return nil, err
+	}
+	if _, err := heap.Create(pool, ClassOID, ClassDesc); err != nil {
+		return nil, err
+	}
+	if _, err := heap.Create(pool, AttributeOID, AttributeDesc); err != nil {
+		return nil, err
+	}
+	c := newCatalog(pool, ctl)
+	for _, rel := range []struct {
+		oid  tuple.OID
+		name string
+	}{{ClassOID, "pg_class"}, {AttributeOID, "pg_attribute"}} {
+		if err := c.insertClass(rel.oid, rel.name, tuple.BootstrapXID); err != nil {
+			return nil, err
+		}
+	}
+	if err := c.insertAttributes(ClassOID, ClassDesc, tuple.BootstrapXID); err != nil {
+		return nil, err
+	}
+	if err := c.insertAttributes(AttributeOID, AttributeDesc, tuple.BootstrapXID); err != nil {
+		return nil, err
+	}
+	if err := pool.FlushAll(); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // Open opens the catalogs of a bootstrapped data directory. Reads the
@@ -95,7 +153,11 @@ func Bootstrap(pool *bufmgr.Pool) (*Catalog, error) {
 // missing; ErrControlCorrupt if it is damaged.
 // PostgreSQL: RelationCacheInitializePhase2 in relcache.c.
 func Open(pool *bufmgr.Pool) (*Catalog, error) {
-	panic("not implemented")
+	ctl, err := ReadControl(pool.Store().Path())
+	if err != nil {
+		return nil, err
+	}
+	return newCatalog(pool, ctl), nil
 }
 
 // Pool returns the buffer pool the catalog reads through.
@@ -106,7 +168,21 @@ func (c *Catalog) Pool() *bufmgr.Pool { return c.pool }
 // repeat across restarts. Safe for concurrent use.
 // PostgreSQL: GetNewObjectId in varsup.c.
 func (c *Catalog) NewOID() (tuple.OID, error) {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.newOID()
+}
+
+// newOID is NewOID with c.mu held.
+func (c *Catalog) newOID() (tuple.OID, error) {
+	oid := c.control.NextOID
+	next := c.control
+	next.NextOID++
+	if err := WriteControl(c.pool.Store().Path(), next); err != nil {
+		return tuple.InvalidOID, err
+	}
+	c.control = next
+	return oid, nil
 }
 
 // CreateTable creates the relation file for a new table and records it in
@@ -117,7 +193,41 @@ func (c *Catalog) NewOID() (tuple.OID, error) {
 // or any row written. Does not flush.
 // PostgreSQL: heap_create_with_catalog in heap.c.
 func (c *Catalog) CreateTable(name string, desc *tuple.Desc, xid tuple.XID) (tuple.OID, error) {
-	panic("not implemented")
+	if len(desc.Attrs) > MaxColumns {
+		return tuple.InvalidOID, ErrTooManyColumns
+	}
+	seen := map[string]bool{}
+	for _, a := range desc.Attrs {
+		if seen[a.Name] {
+			return tuple.InvalidOID, ErrDuplicateColumn
+		}
+		seen[a.Name] = true
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, err := c.findClass(func(r *RelationInfo) bool { return r.Name == name }); err == nil {
+		return tuple.InvalidOID, ErrExists
+	} else if !errors.Is(err, ErrNotFound) {
+		return tuple.InvalidOID, err
+	}
+
+	oid, err := c.newOID()
+	if err != nil {
+		return tuple.InvalidOID, err
+	}
+	if _, err := heap.Create(c.pool, oid, desc); err != nil {
+		return tuple.InvalidOID, err
+	}
+	if err := c.insertClass(oid, name, xid); err != nil {
+		return tuple.InvalidOID, err
+	}
+	if err := c.insertAttributes(oid, desc, xid); err != nil {
+		return tuple.InvalidOID, err
+	}
+	c.invalidate()
+	return oid, nil
 }
 
 // DropTable deletes a table's catalog rows, stamping them with xid, and
@@ -126,7 +236,31 @@ func (c *Catalog) CreateTable(name string, desc *tuple.Desc, xid tuple.XID) (tup
 // flush.
 // PostgreSQL: heap_drop_with_catalog in heap.c.
 func (c *Catalog) DropTable(name string, xid tuple.XID) error {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tid, info, err := c.findClassTID(func(r *RelationInfo) bool { return r.Name == name })
+	if err != nil {
+		return err
+	}
+	if info.OID < FirstUserOID {
+		return ErrSystemTable
+	}
+	if err := c.class.Delete(tid, xid); err != nil {
+		return err
+	}
+	attrTIDs, err := c.findAttributeTIDs(info.OID)
+	if err != nil {
+		return err
+	}
+	for _, tid := range attrTIDs {
+		if err := c.attr.Delete(tid, xid); err != nil {
+			return err
+		}
+	}
+	c.invalidate()
+	c.pool.Discard(info.OID)
+	return c.pool.Store().Unlink(info.OID)
 }
 
 // Lookup finds a relation by name. Names are compared exactly. Returns
@@ -135,18 +269,217 @@ func (c *Catalog) DropTable(name string, xid tuple.XID) error {
 // PostgreSQL: RelnameGetRelid in namespace.c, then RelationIdGetRelation
 // in relcache.c.
 func (c *Catalog) Lookup(name string) (*RelationInfo, error) {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if info, ok := c.cache[name]; ok {
+		return info, nil
+	}
+	info, err := c.findClass(func(r *RelationInfo) bool { return r.Name == name })
+	if err != nil {
+		return nil, err
+	}
+	if err := c.loadAttributes(info); err != nil {
+		return nil, err
+	}
+	c.cache[name] = info
+	return info, nil
 }
 
 // LookupOID finds a relation by OID. Returns ErrNotFound for an unknown or
 // dropped table. Shares the cache with Lookup.
 // PostgreSQL: RelationIdGetRelation in relcache.c.
 func (c *Catalog) LookupOID(oid tuple.OID) (*RelationInfo, error) {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, info := range c.cache {
+		if info.OID == oid {
+			return info, nil
+		}
+	}
+	info, err := c.findClass(func(r *RelationInfo) bool { return r.OID == oid })
+	if err != nil {
+		return nil, err
+	}
+	if err := c.loadAttributes(info); err != nil {
+		return nil, err
+	}
+	c.cache[info.Name] = info
+	return info, nil
 }
 
 // Tables lists every relation in pg_class, sorted by name, catalogs
 // included. Entries are the cached pointers Lookup returns.
 func (c *Catalog) Tables() ([]*RelationInfo, error) {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var infos []*RelationInfo
+	err := c.scanClass(func(_ tuple.TID, info *RelationInfo) (bool, error) {
+		if cached, ok := c.cache[info.Name]; ok {
+			infos = append(infos, cached)
+			return true, nil
+		}
+		if err := c.loadAttributes(info); err != nil {
+			return false, err
+		}
+		c.cache[info.Name] = info
+		infos = append(infos, info)
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].Name < infos[j].Name })
+	return infos, nil
+}
+
+// invalidate drops the relation cache. Called after any catalog change.
+func (c *Catalog) invalidate() {
+	c.cache = map[string]*RelationInfo{}
+}
+
+// insertClass adds a pg_class row.
+func (c *Catalog) insertClass(oid tuple.OID, name string, xid tuple.XID) error {
+	t, err := tuple.Form(ClassDesc, []tuple.Datum{
+		int32(oid), name, string(RelKindTable), int32(0), int64(0),
+	}, nil)
+	if err != nil {
+		return err
+	}
+	_, err = c.class.Insert(t, xid)
+	return err
+}
+
+// insertAttributes adds one pg_attribute row per column of desc.
+func (c *Catalog) insertAttributes(oid tuple.OID, desc *tuple.Desc, xid tuple.XID) error {
+	for i, a := range desc.Attrs {
+		t, err := tuple.Form(AttributeDesc, []tuple.Datum{
+			int32(oid), a.Name, int32(a.Type), int32(i + 1), a.NotNull,
+		}, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := c.attr.Insert(t, xid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// scanClass calls fn for every visible pg_class row until it returns false.
+// The RelationInfo has no Desc yet.
+func (c *Catalog) scanClass(fn func(tuple.TID, *RelationInfo) (bool, error)) error {
+	s := c.class.Scan()
+	defer s.Close()
+	for s.Next() {
+		v, _, err := tuple.Deform(ClassDesc, s.Tuple())
+		if err != nil {
+			return err
+		}
+		info := &RelationInfo{
+			OID:    tuple.OID(v[0].(int32)),
+			Name:   v[1].(string),
+			Kind:   RelKind(v[2].(string)[0]),
+			Pages:  v[3].(int32),
+			Tuples: v[4].(int64),
+		}
+		more, err := fn(s.TID(), info)
+		if err != nil {
+			return err
+		}
+		if !more {
+			return nil
+		}
+	}
+	return s.Err()
+}
+
+// findClassTID returns the first pg_class row matching pred and its TID.
+func (c *Catalog) findClassTID(pred func(*RelationInfo) bool) (tuple.TID, *RelationInfo, error) {
+	var (
+		foundTID tuple.TID
+		found    *RelationInfo
+	)
+	err := c.scanClass(func(tid tuple.TID, info *RelationInfo) (bool, error) {
+		if pred(info) {
+			foundTID, found = tid, info
+			return false, nil
+		}
+		return true, nil
+	})
+	if err != nil {
+		return tuple.TID{}, nil, err
+	}
+	if found == nil {
+		return tuple.TID{}, nil, ErrNotFound
+	}
+	return foundTID, found, nil
+}
+
+func (c *Catalog) findClass(pred func(*RelationInfo) bool) (*RelationInfo, error) {
+	_, info, err := c.findClassTID(pred)
+	return info, err
+}
+
+// attribute is one pg_attribute row.
+type attribute struct {
+	tid  tuple.TID
+	num  int32
+	attr tuple.Attr
+}
+
+// scanAttributes returns the pg_attribute rows of a relation sorted by
+// attnum.
+func (c *Catalog) scanAttributes(oid tuple.OID) ([]attribute, error) {
+	s := c.attr.Scan()
+	defer s.Close()
+	var attrs []attribute
+	for s.Next() {
+		v, _, err := tuple.Deform(AttributeDesc, s.Tuple())
+		if err != nil {
+			return nil, err
+		}
+		if tuple.OID(v[0].(int32)) != oid {
+			continue
+		}
+		attrs = append(attrs, attribute{
+			tid: s.TID(),
+			num: v[3].(int32),
+			attr: tuple.Attr{
+				Name:    v[1].(string),
+				Type:    tuple.TypeID(v[2].(int32)),
+				NotNull: v[4].(bool),
+			},
+		})
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	sort.Slice(attrs, func(i, j int) bool { return attrs[i].num < attrs[j].num })
+	return attrs, nil
+}
+
+// loadAttributes fills info.Desc from pg_attribute.
+func (c *Catalog) loadAttributes(info *RelationInfo) error {
+	attrs, err := c.scanAttributes(info.OID)
+	if err != nil {
+		return err
+	}
+	desc := tuple.NewDesc()
+	for _, a := range attrs {
+		desc.Attrs = append(desc.Attrs, a.attr)
+	}
+	info.Desc = desc
+	return nil
+}
+
+func (c *Catalog) findAttributeTIDs(oid tuple.OID) ([]tuple.TID, error) {
+	attrs, err := c.scanAttributes(oid)
+	if err != nil {
+		return nil, err
+	}
+	tids := make([]tuple.TID, len(attrs))
+	for i, a := range attrs {
+		tids[i] = a.tid
+	}
+	return tids, nil
 }
