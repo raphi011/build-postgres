@@ -154,3 +154,6 @@ func Tokenize(src string) ([]Token, error) {
 		}
 	}
 }
+
+// IsKeyword reports whether word (already lower-cased) is a keyword.
+func IsKeyword(word string) bool { return keywords[word] }

@@ -138,3 +138,22 @@ still be a column name. We have one class and keep the list short instead.
 Type names (`int4`, `text`) are identifiers that the parser recognises,
 which is also how PostgreSQL treats the ones that are not SQL-standard
 words.
+
+## D18: The AST prints as canonical SQL, and that is the golden format
+
+Every node has a `String()` that renders SQL with upper-case keywords,
+every operator application in parentheses, and identifiers quoted only
+when needed. The parser tests compare against this text instead of
+against struct literals, so a precedence case reads as `(a OR (b AND c))`
+rather than three nested composite literals, and every golden case is
+re-parsed from its rendering to check that the printer and the parser
+agree. Chapter 14's `EXPLAIN` reuses the expression printer.
+
+## D19: The parser maps type names, and returns a statement list
+
+There is no `pg_type`, so `int`, `integer`, `int4`, `bigint`, `int8`,
+`bool`, `boolean`, and `text` are resolved to `tuple.TypeID` in the
+parser and an unknown type name is a parse error (`ErrUnknownType`)
+rather than an analysis error. `Parse` returns every statement in the
+input, separated by semicolons, so the regression runner (chapter 11) can
+hand it a whole file; the REPL passes one statement at a time.
