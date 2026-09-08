@@ -164,7 +164,7 @@ func (a *analyzer) addRel(sc *scope, name, alias string, pos lexer.Pos) (*query.
 			return nil, errAt(pos, ErrDuplicateAlias, "table name %q specified more than once", alias)
 		}
 	}
-	entry := &query.RangeEntry{Alias: alias, Rel: info}
+	entry := &query.RangeEntry{Index: len(sc.entries), Alias: alias, Rel: info}
 	sc.entries = append(sc.entries, entry)
 	return entry, nil
 }
@@ -580,12 +580,12 @@ func (a *analyzer) expr(sc *scope, e ast.Expr) (query.Expr, error) {
 
 func (a *analyzer) columnRef(sc *scope, ref *ast.ColumnRef) (query.Expr, error) {
 	if ref.Table != "" {
-		for i, e := range sc.entries[sc.from:] {
+		for _, e := range sc.entries[sc.from:] {
 			if e.Alias != ref.Table {
 				continue
 			}
 			if j := attrIndex(e.Rel.Desc, ref.Name); j >= 0 {
-				return a.newVar(e, sc.from+i, j), nil
+				return a.newVar(e, e.Index, j), nil
 			}
 			return nil, errAt(ref.Loc, ErrUndefinedColumn, "column %s.%s does not exist", ref.Table, ref.Name)
 		}
@@ -597,7 +597,7 @@ func (a *analyzer) columnRef(sc *scope, ref *ast.ColumnRef) (query.Expr, error) 
 		return nil, errAt(ref.Loc, ErrUndefinedTable, "missing FROM-clause entry for table %q", ref.Table)
 	}
 	var found *query.Var
-	for i, e := range sc.entries[sc.from:] {
+	for _, e := range sc.entries[sc.from:] {
 		j := attrIndex(e.Rel.Desc, ref.Name)
 		if j < 0 {
 			continue
@@ -605,7 +605,7 @@ func (a *analyzer) columnRef(sc *scope, ref *ast.ColumnRef) (query.Expr, error) 
 		if found != nil {
 			return nil, errAt(ref.Loc, ErrAmbiguousColumn, "column reference %q is ambiguous", ref.Name)
 		}
-		found = a.newVar(e, sc.from+i, j)
+		found = a.newVar(e, e.Index, j)
 	}
 	if found == nil {
 		return nil, errAt(ref.Loc, ErrUndefinedColumn, "column %q does not exist", ref.Name)

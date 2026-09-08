@@ -216,17 +216,28 @@ func describe(n Node) (head string, props []string, children []Node) {
 		return "Limit", nil, []Node{n.Input}
 	case *ModifyTable:
 		return n.Op.String() + " on " + ast.QuoteIdent(n.Rel.Rel.Name), nil, []Node{n.Input}
+	case *NestLoop:
+		if n.Qual != nil {
+			props = []string{"Join Filter: " + n.Qual.String()}
+		}
+		return "Nested Loop", props, []Node{n.Outer, n.Inner}
+	case *HashJoin:
+		props = []string{"Hash Cond: " + conjunction(n.HashQuals).String()}
+		if n.Qual != nil {
+			props = append(props, "Join Filter: "+n.Qual.String())
+		}
+		return "Hash Join", props, []Node{n.Outer, n.Inner}
+	case *Hash:
+		return "Hash", nil, []Node{n.Input}
+	case *Materialize:
+		return "Materialize", nil, []Node{n.Input}
 	case *IndexScan:
 		head = "Index Scan using " + ast.QuoteIdent(n.Index.Name) + " on " + ast.QuoteIdent(n.Rel.Rel.Name)
 		if n.Rel.Alias != n.Rel.Rel.Name {
 			head += " " + ast.QuoteIdent(n.Rel.Alias)
 		}
-		switch len(n.Quals) {
-		case 0:
-		case 1:
-			props = []string{"Index Cond: " + n.Quals[0].String()}
-		default:
-			props = []string{"Index Cond: " + (&query.BoolExpr{Op: query.And, Args: n.Quals}).String()}
+		if len(n.Quals) > 0 {
+			props = []string{"Index Cond: " + conjunction(n.Quals).String()}
 		}
 		return head, props, nil
 	}
@@ -263,6 +274,14 @@ func ExplainCosts(n Node) []string {
 	var lines []string
 	explain(n, 0, &lines, true)
 	return lines
+}
+
+// conjunction ANDs quals together; one qual is returned as is.
+func conjunction(quals []query.Expr) query.Expr {
+	if len(quals) == 1 {
+		return quals[0]
+	}
+	return &query.BoolExpr{Op: query.And, Args: quals}
 }
 
 // Chapter 15: joins.

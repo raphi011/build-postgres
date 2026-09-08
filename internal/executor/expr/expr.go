@@ -61,10 +61,22 @@ type Layout []int
 // given order, at the positions their Index says. NewLayout(nil) is
 // Layout{0}: no columns, width zero.
 func NewLayout(rng []*query.RangeEntry) Layout {
-	l := make(Layout, len(rng)+1)
-	for i, e := range rng {
-		l[i+1] = l[i] + e.Rel.Desc.Len()
+	n := 0
+	for _, e := range rng {
+		if e.Index >= n {
+			n = e.Index + 1
+		}
 	}
+	l := make(Layout, n+1)
+	for i := range l {
+		l[i] = -1
+	}
+	slot := 0
+	for _, e := range rng {
+		l[e.Index] = slot
+		slot += e.Rel.Desc.Len()
+	}
+	l[n] = slot
 	return l
 }
 

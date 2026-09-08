@@ -4,8 +4,10 @@
 package executor
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"sort"
 
 	"github.com/raphi011/build-postgres/internal/btree"
@@ -66,11 +68,26 @@ type Env struct {
 	XID  tuple.XID
 }
 
+// outerRow is the current row of a NestLoop's outer side, which its
+// inner side evaluates outer references against: the loop stores each
+// outer row here before it rescans the inner side.
+// PostgreSQL: the PARAM_EXEC slots a nested loop sets in ExecNestLoop.
+type outerRow struct {
+	layout expr.Layout
+	row    expr.Row
+}
+
 // Build turns a plan tree into an executor tree. It does no I/O. Panics
 // on a plan node it does not know, and on a HashJoin whose Inner is not
 // a Hash.
 // PostgreSQL: ExecInitNode in execProcnode.c.
 func Build(p plan.Node, env *Env) Node {
+	return build(p, env, nil)
+}
+
+// build is Build with the outer row a parameterised node reads; nil
+// outside a NestLoop's inner side.
+func build(p plan.Node, env *Env, outer *outerRow) Node {
 	switch p := p.(type) {
 	case *plan.Result:
 		return &result{}
@@ -79,18 +96,34 @@ func Build(p plan.Node, env *Env) Node {
 	case *plan.SeqScan:
 		return &seqScan{env: env, rel: p.Rel}
 	case *plan.IndexScan:
-		return &indexScan{env: env, rel: p.Rel, index: p.Index, quals: p.Quals}
+		return &indexScan{env: env, rel: p.Rel, index: p.Index, quals: p.Quals, outer: outer}
 	case *plan.Filter:
-		return &filter{input: Build(p.Input, env), layout: expr.NewLayout(p.Input.Range()), qual: p.Qual}
+		return &filter{input: build(p.Input, env, outer), layout: expr.NewLayout(p.Input.Range()), qual: p.Qual}
 	case *plan.Project:
-		return &project{input: Build(p.Input, env), layout: expr.NewLayout(p.Input.Range()), targets: p.Targets}
+		return &project{input: build(p.Input, env, outer), layout: expr.NewLayout(p.Input.Range()), targets: p.Targets}
 	case *plan.Sort:
-		return &sortNode{input: Build(p.Input, env), layout: expr.NewLayout(p.Input.Range()), keys: p.Keys}
+		return &sortNode{input: build(p.Input, env, outer), layout: expr.NewLayout(p.Input.Range()), keys: p.Keys}
 	case *plan.Limit:
-		return &limit{input: Build(p.Input, env), count: p.Count}
+		return &limit{input: build(p.Input, env, outer), count: p.Count}
 	case *plan.ModifyTable:
-		return &modifyTable{env: env, op: p.Op, rel: p.Rel, input: Build(p.Input, env),
+		return &modifyTable{env: env, op: p.Op, rel: p.Rel, input: build(p.Input, env, outer),
 			layout: expr.NewLayout(p.Input.Range()), set: p.Set}
+	case *plan.NestLoop:
+		param := &outerRow{layout: expr.NewLayout(p.Outer.Range())}
+		return &nestLoop{outer: build(p.Outer, env, outer), inner: build(p.Inner, env, param), param: param,
+			layout: expr.NewLayout(p.Range()), qual: p.Qual}
+	case *plan.HashJoin:
+		h, ok := build(p.Inner, env, outer).(*hash)
+		if !ok {
+			panic(fmt.Sprintf("executor: HashJoin inner is %T, want *plan.Hash", p.Inner))
+		}
+		return &hashJoin{outer: build(p.Outer, env, outer), inner: h, hashQuals: p.HashQuals, qual: p.Qual,
+			outerLayout: expr.NewLayout(p.Outer.Range()), innerLayout: expr.NewLayout(p.Inner.Range()),
+			layout: expr.NewLayout(p.Range())}
+	case *plan.Hash:
+		return &hash{input: build(p.Input, env, outer)}
+	case *plan.Materialize:
+		return &materialize{input: build(p.Input, env, outer)}
 	}
 	panic(fmt.Sprintf("executor: cannot build %T", p))
 }
@@ -142,7 +175,8 @@ func (n *result) Next() (Row, bool, error) {
 	n.done = true
 	return Row{}, true, nil
 }
-func (n *result) Close() error { return nil }
+func (n *result) Rescan() error { n.done = false; return nil }
+func (n *result) Close() error  { return nil }
 
 // values evaluates one expression list per row against an empty row.
 type values struct {
@@ -169,7 +203,8 @@ func (n *values) Next() (Row, bool, error) {
 	return Row{Row: r}, err == nil, err
 }
 
-func (n *values) Close() error { return nil }
+func (n *values) Rescan() error { n.pos = 0; return nil }
+func (n *values) Close() error  { return nil }
 
 // seqScan reads a relation through heap.Scan.
 type seqScan struct {
@@ -194,29 +229,56 @@ func (n *seqScan) Next() (Row, bool, error) {
 	return Row{Row: expr.Row{Values: vals, Nulls: nulls}, TID: n.scan.TID()}, true, nil
 }
 
+func (n *seqScan) Rescan() error {
+	n.scan.Close()
+	return n.Open()
+}
+
 func (n *seqScan) Close() error {
 	n.scan.Close()
 	return nil
 }
 
 // indexScan reads a key range of an index and fetches each entry's heap
-// tuple, skipping dead ones.
+// tuple, skipping dead ones. The bounds are evaluated on the first Next
+// after Open or Rescan, against the outer row when there is one.
 type indexScan struct {
-	env   *Env
-	rel   *query.RangeEntry
-	index *catalog.IndexInfo
-	quals []query.Expr
-	heap  *heap.Relation
-	scan  *btree.Scan
-	none  bool // a NULL bound: no row can match
+	env    *Env
+	rel    *query.RangeEntry
+	index  *catalog.IndexInfo
+	quals  []query.Expr
+	outer  *outerRow
+	bounds []expr.Func
+	heap   *heap.Relation
+	scan   *btree.Scan
+	none   bool // a NULL bound: no row can match
 }
 
 func (n *indexScan) Open() error {
+	layout := expr.NewLayout(nil)
+	if n.outer != nil {
+		layout = n.outer.layout
+	}
+	n.bounds = make([]expr.Func, len(n.quals))
+	for i, q := range n.quals {
+		n.bounds[i] = expr.Compile(q.(*query.OpExpr).Right, layout)
+	}
+	n.heap = heap.Open(n.env.Pool, n.rel.Rel.OID, n.rel.Rel.Desc)
+	n.scan = nil
+	return nil
+}
+
+// start evaluates the bounds and opens the tree scan.
+func (n *indexScan) start() error {
 	n.none = false
+	var row expr.Row
+	if n.outer != nil {
+		row = n.outer.row
+	}
 	var lo, hi *btree.Bound
-	for _, q := range n.quals {
+	for i, q := range n.quals {
 		op := q.(*query.OpExpr)
-		v, null, err := expr.Compile(op.Right, expr.NewLayout(nil))(expr.Row{})
+		v, null, err := n.bounds[i](row)
 		if err != nil {
 			return err
 		}
@@ -236,7 +298,6 @@ func (n *indexScan) Open() error {
 			return fmt.Errorf("executor: index scan cannot use operator %s", op.Op)
 		}
 	}
-	n.heap = heap.Open(n.env.Pool, n.rel.Rel.OID, n.rel.Rel.Desc)
 	n.scan = index.Open(n.env.Pool, n.rel.Rel, n.index).Scan(lo, hi)
 	return nil
 }
@@ -256,6 +317,11 @@ func tighten(cur, b *btree.Bound, dir int) *btree.Bound {
 }
 
 func (n *indexScan) Next() (Row, bool, error) {
+	if n.scan == nil && !n.none {
+		if err := n.start(); err != nil {
+			return Row{}, false, err
+		}
+	}
 	if n.none {
 		return Row{}, false, nil
 	}
@@ -277,6 +343,15 @@ func (n *indexScan) Next() (Row, bool, error) {
 		return Row{Row: expr.Row{Values: vals, Nulls: nulls}, TID: n.scan.TID()}, true, nil
 	}
 	return Row{}, false, n.scan.Err()
+}
+
+func (n *indexScan) Rescan() error {
+	if n.scan != nil {
+		n.scan.Close()
+		n.scan = nil
+	}
+	n.none = false
+	return nil
 }
 
 func (n *indexScan) Close() error {
@@ -315,7 +390,8 @@ func (n *filter) Next() (Row, bool, error) {
 	}
 }
 
-func (n *filter) Close() error { return n.input.Close() }
+func (n *filter) Rescan() error { return n.input.Rescan() }
+func (n *filter) Close() error  { return n.input.Close() }
 
 // project evaluates the target list against each input row.
 type project struct {
@@ -346,7 +422,8 @@ func (n *project) Next() (Row, bool, error) {
 	return Row{Row: out, TID: r.TID}, true, nil
 }
 
-func (n *project) Close() error { return n.input.Close() }
+func (n *project) Rescan() error { return n.input.Rescan() }
+func (n *project) Close() error  { return n.input.Close() }
 
 // sortNode materialises its input on the first Next and sorts it.
 type sortNode struct {
@@ -440,12 +517,18 @@ func compareNullable(a tuple.Datum, aNull bool, b tuple.Datum, bNull bool) int {
 	return expr.Compare(a, b)
 }
 
+func (n *sortNode) Rescan() error {
+	n.rows, n.sorted, n.pos = nil, false, 0
+	return n.input.Rescan()
+}
+
 func (n *sortNode) Close() error { return n.input.Close() }
 
 // limit passes the first count rows and stops pulling after that.
 type limit struct {
 	input Node
 	count query.Expr
+	total int64
 	left  int64
 	all   bool
 }
@@ -457,11 +540,12 @@ func (n *limit) Open() error {
 	}
 	n.all = null
 	if !null {
-		n.left = v.(int64)
-		if n.left < 0 {
+		n.total = v.(int64)
+		if n.total < 0 {
 			return &Error{Err: ErrInvalidRowCount, Msg: "LIMIT must not be negative"}
 		}
 	}
+	n.left = n.total
 	return n.input.Open()
 }
 
@@ -473,6 +557,11 @@ func (n *limit) Next() (Row, bool, error) {
 		n.left--
 	}
 	return n.input.Next()
+}
+
+func (n *limit) Rescan() error {
+	n.left = n.total
+	return n.input.Rescan()
 }
 
 func (n *limit) Close() error { return n.input.Close() }
@@ -585,7 +674,308 @@ func (n *modifyTable) form(vals []tuple.Datum, nulls []bool) (tuple.Tuple, error
 	return tuple.Form(desc, vals, nulls)
 }
 
+func (n *modifyTable) Rescan() error {
+	n.count, n.done = 0, false
+	return n.input.Rescan()
+}
+
 func (n *modifyTable) Close() error { return n.input.Close() }
+
+// Chapter 15: joins.
+
+// nestLoop pairs each outer row with every inner row, rescanning the
+// inner side once per outer row with that row as its parameter.
+// PostgreSQL: ExecNestLoop in nodeNestloop.c.
+type nestLoop struct {
+	outer, inner Node
+	param        *outerRow
+	layout       expr.Layout
+	qual         query.Expr
+	f            expr.Func
+	cur          Row
+	haveOuter    bool
+}
+
+func (n *nestLoop) Open() error {
+	n.f = nil
+	if n.qual != nil {
+		n.f = expr.Compile(n.qual, n.layout)
+	}
+	n.haveOuter = false
+	if err := n.outer.Open(); err != nil {
+		return err
+	}
+	return n.inner.Open()
+}
+
+func (n *nestLoop) Next() (Row, bool, error) {
+	for {
+		if !n.haveOuter {
+			r, ok, err := n.outer.Next()
+			if err != nil || !ok {
+				return Row{}, false, err
+			}
+			n.cur, n.haveOuter = r, true
+			n.param.row = r.Row
+			if err := n.inner.Rescan(); err != nil {
+				return Row{}, false, err
+			}
+		}
+		ir, ok, err := n.inner.Next()
+		if err != nil {
+			return Row{}, false, err
+		}
+		if !ok {
+			n.haveOuter = false
+			continue
+		}
+		row := joinRows(n.cur, ir)
+		if n.f != nil {
+			pass, err := n.f.Qual(row.Row)
+			if err != nil {
+				return Row{}, false, err
+			}
+			if !pass {
+				continue
+			}
+		}
+		return row, true, nil
+	}
+}
+
+func (n *nestLoop) Rescan() error {
+	n.haveOuter = false
+	return n.outer.Rescan()
+}
+
+func (n *nestLoop) Close() error {
+	err := n.outer.Close()
+	if cerr := n.inner.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
+
+// joinRows is the outer row's columns followed by the inner row's, in a
+// fresh row without a TID.
+func joinRows(outer, inner Row) Row {
+	vals := make([]tuple.Datum, 0, len(outer.Values)+len(inner.Values))
+	nulls := make([]bool, 0, len(outer.Nulls)+len(inner.Nulls))
+	return Row{Row: expr.Row{
+		Values: append(append(vals, outer.Values...), inner.Values...),
+		Nulls:  append(append(nulls, outer.Nulls...), inner.Nulls...),
+	}}
+}
+
+// materialize stores its input's rows on the first pass and replays
+// them after a Rescan.
+// PostgreSQL: ExecMaterial in nodeMaterial.c.
+type materialize struct {
+	input  Node
+	rows   []Row
+	loaded bool
+	pos    int
+}
+
+func (n *materialize) Open() error {
+	n.rows, n.loaded, n.pos = nil, false, 0
+	return n.input.Open()
+}
+
+func (n *materialize) Next() (Row, bool, error) {
+	if !n.loaded {
+		for {
+			r, ok, err := n.input.Next()
+			if err != nil {
+				return Row{}, false, err
+			}
+			if !ok {
+				break
+			}
+			n.rows = append(n.rows, r)
+		}
+		n.loaded = true
+	}
+	if n.pos >= len(n.rows) {
+		return Row{}, false, nil
+	}
+	r := n.rows[n.pos]
+	n.pos++
+	return r, true, nil
+}
+
+func (n *materialize) Rescan() error { n.pos = 0; return nil }
+func (n *materialize) Close() error  { return n.input.Close() }
+
+// hashTable buckets rows by the hash of their key values; the hash join
+// checks the actual equality on the rows of a bucket.
+type hashTable map[uint64][]Row
+
+// hash reads its input into the hash table when the join asks for it.
+// It yields no rows through Next.
+// PostgreSQL: MultiExecHash in nodeHash.c.
+type hash struct {
+	input Node
+}
+
+func (n *hash) Open() error { return n.input.Open() }
+func (n *hash) Next() (Row, bool, error) {
+	return Row{}, false, errors.New("executor: Hash node does not support Next")
+}
+func (n *hash) Rescan() error { return n.input.Rescan() }
+func (n *hash) Close() error  { return n.input.Close() }
+
+// build reads every input row into a table keyed by the hash of keys;
+// rows with a NULL key are left out, since NULL is equal to nothing.
+func (n *hash) build(keys []expr.Func) (hashTable, error) {
+	table := hashTable{}
+	for {
+		r, ok, err := n.input.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return table, nil
+		}
+		h, null, err := hashKeys(keys, r.Row)
+		if err != nil {
+			return nil, err
+		}
+		if !null {
+			table[h] = append(table[h], r)
+		}
+	}
+}
+
+// hashKeys evaluates the key expressions against r and hashes the
+// values together; null reports that one of them is NULL.
+func hashKeys(keys []expr.Func, r expr.Row) (h uint64, null bool, err error) {
+	f := fnv.New64a()
+	var buf [8]byte
+	for _, k := range keys {
+		v, isNull, err := k(r)
+		if err != nil {
+			return 0, false, err
+		}
+		if isNull {
+			return 0, true, nil
+		}
+		switch v := v.(type) {
+		case int32:
+			binary.LittleEndian.PutUint32(buf[:4], uint32(v))
+			f.Write(buf[:4])
+		case int64:
+			binary.LittleEndian.PutUint64(buf[:8], uint64(v))
+			f.Write(buf[:8])
+		case bool:
+			buf[0] = 0
+			if v {
+				buf[0] = 1
+			}
+			f.Write(buf[:1])
+		case string:
+			f.Write([]byte(v))
+			f.Write([]byte{0})
+		default:
+			return 0, false, fmt.Errorf("executor: cannot hash %T", v)
+		}
+	}
+	return f.Sum64(), false, nil
+}
+
+// hashJoin builds the inner side's hash table on the first Next, then
+// probes it with each outer row and checks the hash quals and the
+// remaining qual on every row of the matching bucket.
+// PostgreSQL: ExecHashJoin in nodeHashjoin.c.
+type hashJoin struct {
+	outer                            Node
+	inner                            *hash
+	hashQuals                        []query.Expr
+	qual                             query.Expr
+	outerLayout, innerLayout, layout expr.Layout
+	outerKeys                        []expr.Func
+	f                                expr.Func // the hash quals and qual, ANDed
+	table                            hashTable
+	cur                              Row
+	bucket                           []Row
+	pos                              int
+	haveOuter                        bool
+}
+
+func (n *hashJoin) Open() error {
+	n.outerKeys = make([]expr.Func, len(n.hashQuals))
+	for i, q := range n.hashQuals {
+		n.outerKeys[i] = expr.Compile(q.(*query.OpExpr).Left, n.outerLayout)
+	}
+	quals := append([]query.Expr(nil), n.hashQuals...)
+	if n.qual != nil {
+		quals = append(quals, n.qual)
+	}
+	n.f = expr.Compile(&query.BoolExpr{Op: query.And, Args: quals}, n.layout)
+	n.table, n.haveOuter = nil, false
+	if err := n.outer.Open(); err != nil {
+		return err
+	}
+	return n.inner.Open()
+}
+
+func (n *hashJoin) Next() (Row, bool, error) {
+	if n.table == nil {
+		keys := make([]expr.Func, len(n.hashQuals))
+		for i, q := range n.hashQuals {
+			keys[i] = expr.Compile(q.(*query.OpExpr).Right, n.innerLayout)
+		}
+		table, err := n.inner.build(keys)
+		if err != nil {
+			return Row{}, false, err
+		}
+		n.table = table
+	}
+	for {
+		if !n.haveOuter {
+			r, ok, err := n.outer.Next()
+			if err != nil || !ok {
+				return Row{}, false, err
+			}
+			h, null, err := hashKeys(n.outerKeys, r.Row)
+			if err != nil {
+				return Row{}, false, err
+			}
+			if null {
+				continue
+			}
+			n.cur, n.bucket, n.pos, n.haveOuter = r, n.table[h], 0, true
+		}
+		if n.pos >= len(n.bucket) {
+			n.haveOuter = false
+			continue
+		}
+		row := joinRows(n.cur, n.bucket[n.pos])
+		n.pos++
+		pass, err := n.f.Qual(row.Row)
+		if err != nil {
+			return Row{}, false, err
+		}
+		if pass {
+			return row, true, nil
+		}
+	}
+}
+
+// Rescan restarts the outer side and keeps the hash table: the inner
+// side does not depend on anything above.
+func (n *hashJoin) Rescan() error {
+	n.haveOuter = false
+	return n.outer.Rescan()
+}
+
+func (n *hashJoin) Close() error {
+	err := n.outer.Close()
+	if cerr := n.inner.Close(); err == nil {
+		err = cerr
+	}
+	return err
+}
 
 // compileAll compiles a list of expressions against one layout.
 func compileAll(exprs []query.Expr, l expr.Layout) []expr.Func {

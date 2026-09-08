@@ -6,6 +6,7 @@ package planner
 import (
 	"errors"
 	"math"
+	"math/bits"
 
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/page"
@@ -77,7 +78,10 @@ const DefaultNumDistinct = 200
 func Plan(q query.Stmt) (plan.Node, error) {
 	switch q := q.(type) {
 	case *query.Select:
-		return planSelect(q)
+		if len(q.Range) > MaxJoinRelations {
+			return nil, ErrTooManyRelations
+		}
+		return planSelect(q), nil
 	case *query.Insert:
 		vals := &plan.Values{Rows: q.Rows}
 		vals.Est = plan.Estimate{
@@ -101,30 +105,31 @@ func modify(op plan.ModifyOp, rel *query.RangeEntry, input plan.Node, set []quer
 		Est: plan.Estimate{StartupCost: in.StartupCost, TotalCost: in.TotalCost}}
 }
 
-func planSelect(q *query.Select) (plan.Node, error) {
-	switch len(q.Range) {
-	case 0:
+func planSelect(q *query.Select) plan.Node {
+	if len(q.Range) == 0 {
 		var n plan.Node = result(q.Targets)
 		if q.Where != nil {
 			n = &plan.Filter{Input: n, Qual: q.Where, Est: n.Estimate()}
 		}
-		return finish(n, q, true), nil
-	case 1:
-	default:
-		return nil, ErrJoin
+		return finish(n, q, true)
 	}
+	p := newPlanner(q.Range, q.Where, q.OrderBy)
+	all := p.search()
 	var best plan.Node
-	for _, path := range scanPaths(q.Range[0], q.Where, q.OrderBy) {
+	for _, path := range p.paths[all] {
+		if path.params != 0 {
+			continue
+		}
 		n := finish(path.node, q, path.ordered)
 		if best == nil || n.Estimate().TotalCost < best.Estimate().TotalCost {
 			best = n
 		}
 	}
-	return best, nil
+	return best
 }
 
 // finish adds Sort (unless the input is already ordered), Project, and
-// Limit above a scan, with their estimates.
+// Limit above a scan or join, with their estimates.
 func finish(n plan.Node, q *query.Select, ordered bool) plan.Node {
 	if len(q.OrderBy) > 0 && !ordered {
 		n = sortNode(n, q.OrderBy)
@@ -134,6 +139,18 @@ func finish(n plan.Node, q *query.Select, ordered bool) plan.Node {
 		n = limit(n, q.Limit)
 	}
 	return n
+}
+
+// cheapestScan is the scan an UPDATE or DELETE reads through.
+func cheapestScan(rel *query.RangeEntry, where query.Expr) plan.Node {
+	p := newPlanner([]*query.RangeEntry{rel}, where, nil)
+	var best plan.Node
+	for _, path := range p.basePaths(0) {
+		if best == nil || path.node.Estimate().TotalCost < best.Estimate().TotalCost {
+			best = path.node
+		}
+	}
+	return best
 }
 
 // result is the input of a SELECT without FROM: one row at the cost of
@@ -200,40 +217,135 @@ func limit(input plan.Node, count query.Expr) plan.Node {
 	}}
 }
 
-// scanPath is one way to read a relation: the scan node with its
-// Filter, and whether its rows come out in the ORDER BY order.
-type scanPath struct {
-	node    plan.Node
-	ordered bool
+// Relation sets and paths.
+
+// relSet is a set of range table indexes, one bit per entry.
+type relSet uint64
+
+func single(i int) relSet               { return 1 << i }
+func (s relSet) has(i int) bool         { return s&single(i) != 0 }
+func (s relSet) subsetOf(t relSet) bool { return s&^t == 0 }
+func (s relSet) size() int              { return bits.OnesCount64(uint64(s)) }
+
+// path is one way to produce the rows of a set of relations: the node
+// with its estimate, whether its rows come out in the ORDER BY order,
+// the relations whose current row it needs from a nested loop above
+// (zero for an ordinary path), and the join quals it applies itself
+// when it does.
+// PostgreSQL: Path in pathnodes.h.
+type path struct {
+	node     plan.Node
+	ordered  bool
+	params   relSet
+	enforced []query.Expr
 }
 
-// scanPaths lists the sequential scan and every index scan that has an
-// index qual or delivers the requested order.
-// PostgreSQL: set_plain_rel_pathlist in allpaths.c and
-// create_index_paths in indxpath.c.
-func scanPaths(rel *query.RangeEntry, where query.Expr, orderBy []query.SortKey) []scanPath {
-	quals := conjuncts(where)
-	paths := []scanPath{{node: seqScan(rel, quals), ordered: len(orderBy) == 0}}
-	for _, idx := range rel.Rel.Indexes {
-		indexQuals, rest := splitQuals(quals, idx)
-		ordered := len(orderBy) == 0 || providesOrder(idx, orderBy)
-		if len(indexQuals) == 0 && !providesOrder(idx, orderBy) {
-			continue
+func (p path) est() plan.Estimate { return p.node.Estimate() }
+
+// planner holds one query's range table, its WHERE conjuncts with the
+// relations each refers to, and the paths found for every relation set.
+type planner struct {
+	rng     []*query.RangeEntry
+	orderBy []query.SortKey
+	quals   []query.Expr
+	qrels   []relSet
+	rows    map[relSet]float64 // base relations: rows after their quals
+	paths   map[relSet][]path
+}
+
+func newPlanner(rng []*query.RangeEntry, where query.Expr, orderBy []query.SortKey) *planner {
+	p := &planner{rng: rng, orderBy: orderBy, quals: conjuncts(where),
+		rows: map[relSet]float64{}, paths: map[relSet][]path{}}
+	for _, q := range p.quals {
+		p.qrels = append(p.qrels, exprRels(q))
+	}
+	return p
+}
+
+// search builds the paths of every relation set by size and returns the
+// set of all relations.
+// PostgreSQL: standard_join_search in joinrels.c.
+func (p *planner) search() relSet {
+	all := relSet(1)<<len(p.rng) - 1
+	for i := range p.rng {
+		p.paths[single(i)] = p.basePaths(i)
+	}
+	for size := 2; size <= len(p.rng); size++ {
+		for s := relSet(1); s <= all; s++ {
+			if s.size() == size {
+				p.joinPaths(s)
+			}
 		}
-		paths = append(paths, scanPath{node: indexScan(rel, idx, indexQuals, rest), ordered: ordered})
+	}
+	return all
+}
+
+// addPath keeps new unless a path already kept is at least as good on
+// every count (startup cost, total cost, order, parameters), and drops
+// the kept paths new beats that way.
+// PostgreSQL: add_path in pathnode.c.
+func addPath(paths []path, new path) []path {
+	for _, old := range paths {
+		if dominates(old, new) {
+			return paths
+		}
+	}
+	kept := paths[:0]
+	for _, old := range paths {
+		if !dominates(new, old) {
+			kept = append(kept, old)
+		}
+	}
+	return append(kept, new)
+}
+
+// dominates reports whether a is at least as good as b on every count.
+func dominates(a, b path) bool {
+	ae, be := a.est(), b.est()
+	return ae.StartupCost <= be.StartupCost && ae.TotalCost <= be.TotalCost &&
+		(a.ordered || !b.ordered) && a.params.subsetOf(b.params)
+}
+
+// Base relations.
+
+// basePaths lists the ways to read relation i: the sequential scan,
+// the index scans with an index qual or the ORDER BY order (chapter
+// 14), and one parameterised index scan per join qual an index can
+// take as its bound.
+// PostgreSQL: set_plain_rel_pathlist in allpaths.c, create_index_paths
+// and match_join_clauses_to_index in indxpath.c.
+func (p *planner) basePaths(i int) []path {
+	rel := p.rng[i]
+	var restrict []query.Expr
+	for k, q := range p.quals {
+		if p.qrels[k] == single(i) || p.qrels[k] == 0 && i == 0 {
+			restrict = append(restrict, q)
+		}
+	}
+	seq := p.seqScan(rel, restrict)
+	p.rows[single(i)] = seq.Estimate().Rows
+	paths := []path{{node: seq, ordered: len(p.orderBy) == 0}}
+	for _, idx := range rel.Rel.Indexes {
+		indexQuals, rest := p.splitQuals(restrict, rel, idx)
+		ordered := p.providesOrder(rel, idx)
+		if len(indexQuals) > 0 || ordered {
+			paths = addPath(paths, path{node: p.indexScan(rel, idx, indexQuals, rest), ordered: ordered || len(p.orderBy) == 0})
+		}
+		for k, q := range p.quals {
+			if p.qrels[k].size() < 2 || !p.qrels[k].has(i) {
+				continue
+			}
+			iq := indexQual(q, rel, idx)
+			if iq == nil {
+				continue
+			}
+			quals := append(append([]query.Expr(nil), indexQuals...), iq)
+			paths = addPath(paths, path{node: p.indexScan(rel, idx, quals, rest),
+				ordered: len(p.orderBy) == 0,
+				params:  p.qrels[k] &^ single(i), enforced: []query.Expr{q}})
+		}
 	}
 	return paths
-}
-
-// cheapestScan is the scan an UPDATE or DELETE reads through.
-func cheapestScan(rel *query.RangeEntry, where query.Expr) plan.Node {
-	var best plan.Node
-	for _, p := range scanPaths(rel, where, nil) {
-		if best == nil || p.node.Estimate().TotalCost < best.Estimate().TotalCost {
-			best = p.node
-		}
-	}
-	return best
 }
 
 // conjuncts splits a WHERE clause into its ANDed parts.
@@ -260,21 +372,20 @@ func conjunction(quals []query.Expr) query.Expr {
 
 // providesOrder reports whether a forward scan of idx yields the ORDER BY
 // order: one ascending key that is the indexed column.
-func providesOrder(idx *catalog.IndexInfo, orderBy []query.SortKey) bool {
-	if len(orderBy) != 1 || orderBy[0].Desc {
+func (p *planner) providesOrder(rel *query.RangeEntry, idx *catalog.IndexInfo) bool {
+	if len(p.orderBy) != 1 || p.orderBy[0].Desc {
 		return false
 	}
-	v, ok := orderBy[0].Expr.(*query.Var)
-	return ok && v.Rel == 0 && v.Attr == idx.Attr
+	return isIndexVar(p.orderBy[0].Expr, rel, idx)
 }
 
 // splitQuals separates the quals an index scan on idx can use (a
 // comparison between the indexed column and an expression without
 // Vars, rewritten with the column on the left) from the rest.
 // PostgreSQL: match_clause_to_indexcol in indxpath.c.
-func splitQuals(quals []query.Expr, idx *catalog.IndexInfo) (indexQuals, rest []query.Expr) {
+func (p *planner) splitQuals(quals []query.Expr, rel *query.RangeEntry, idx *catalog.IndexInfo) (indexQuals, rest []query.Expr) {
 	for _, q := range quals {
-		if iq := indexQual(q, idx); iq != nil {
+		if iq := indexQual(q, rel, idx); iq != nil {
 			indexQuals = append(indexQuals, iq)
 		} else {
 			rest = append(rest, q)
@@ -283,7 +394,10 @@ func splitQuals(quals []query.Expr, idx *catalog.IndexInfo) (indexQuals, rest []
 	return indexQuals, rest
 }
 
-func indexQual(q query.Expr, idx *catalog.IndexInfo) query.Expr {
+// indexQual returns q rewritten as an index qual on idx, with the
+// indexed column alone on the left and an expression without that
+// relation's columns on the right, or nil when q is not one.
+func indexQual(q query.Expr, rel *query.RangeEntry, idx *catalog.IndexInfo) query.Expr {
 	op, ok := q.(*query.OpExpr)
 	if !ok {
 		return nil
@@ -303,18 +417,243 @@ func indexQual(q query.Expr, idx *catalog.IndexInfo) query.Expr {
 	default:
 		return nil
 	}
-	if isIndexVar(op.Left, idx) && !hasVar(op.Right) {
+	if isIndexVar(op.Left, rel, idx) && !exprRels(op.Right).has(rel.Index) {
 		return op
 	}
-	if isIndexVar(op.Right, idx) && !hasVar(op.Left) {
+	if isIndexVar(op.Right, rel, idx) && !exprRels(op.Left).has(rel.Index) {
 		return &query.OpExpr{Op: flipped, Typ: op.Typ, Left: op.Right, Right: op.Left}
 	}
 	return nil
 }
 
-func isIndexVar(e query.Expr, idx *catalog.IndexInfo) bool {
+func isIndexVar(e query.Expr, rel *query.RangeEntry, idx *catalog.IndexInfo) bool {
 	v, ok := e.(*query.Var)
-	return ok && v.Rel == 0 && v.Attr == idx.Attr
+	return ok && v.Rel == rel.Index && v.Attr == idx.Attr
+}
+
+// Joins.
+
+// joinPaths builds the paths of relation set s from every split into an
+// outer and an inner set: a nested loop over a materialised inner path,
+// a nested loop over an inner path parameterised by the outer set, and
+// a hash join when an equality joins the two sides. Splits are tried
+// in increasing order of the outer set.
+// PostgreSQL: make_join_rel in joinrels.c, add_paths_to_joinrel and
+// match_unsorted_outer in joinpath.c.
+func (p *planner) joinPaths(s relSet) {
+	for outer := relSet(1); outer < s; outer++ {
+		if !outer.subsetOf(s) {
+			continue
+		}
+		inner := s &^ outer
+		var joinQuals []query.Expr
+		for k, q := range p.quals {
+			if r := p.qrels[k]; r.subsetOf(s) && !r.subsetOf(outer) && !r.subsetOf(inner) {
+				joinQuals = append(joinQuals, q)
+			}
+		}
+		for _, o := range p.paths[outer] {
+			if o.params != 0 {
+				continue
+			}
+			for _, in := range p.paths[inner] {
+				switch {
+				case in.params == 0:
+					p.paths[s] = addPath(p.paths[s], p.nestLoop(s, o, path{node: materialize(in.node)}, joinQuals))
+					if hashQuals, rest := splitHashQuals(joinQuals, outer, inner); len(hashQuals) > 0 {
+						p.paths[s] = addPath(p.paths[s], p.hashJoin(s, o, in, hashQuals, rest))
+					}
+				case in.params.subsetOf(outer):
+					var rest []query.Expr
+					for _, q := range joinQuals {
+						if !contains(in.enforced, q) {
+							rest = append(rest, q)
+						}
+					}
+					p.paths[s] = addPath(p.paths[s], p.nestLoop(s, o, in, rest))
+				}
+			}
+		}
+	}
+}
+
+func contains(exprs []query.Expr, e query.Expr) bool {
+	for _, x := range exprs {
+		if x == e {
+			return true
+		}
+	}
+	return false
+}
+
+// splitHashQuals separates the equalities between the two sides, each
+// rewritten with the outer side's expression on the left, from the
+// other join quals.
+// PostgreSQL: select_mergejoin_clauses / hash_inner_and_outer in
+// joinpath.c.
+func splitHashQuals(joinQuals []query.Expr, outer, inner relSet) (hashQuals, rest []query.Expr) {
+	for _, q := range joinQuals {
+		op, ok := q.(*query.OpExpr)
+		if ok && op.Op == ast.Eq {
+			l, r := exprRels(op.Left), exprRels(op.Right)
+			switch {
+			case l != 0 && r != 0 && l.subsetOf(outer) && r.subsetOf(inner):
+				hashQuals = append(hashQuals, op)
+				continue
+			case l != 0 && r != 0 && l.subsetOf(inner) && r.subsetOf(outer):
+				hashQuals = append(hashQuals, &query.OpExpr{Op: ast.Eq, Typ: op.Typ, Left: op.Right, Right: op.Left})
+				continue
+			}
+		}
+		rest = append(rest, q)
+	}
+	return hashQuals, rest
+}
+
+// joinRows estimates the rows of relation set s: the product of its
+// base relations' rows and of the selectivities of the join quals
+// within it.
+// PostgreSQL: calc_joinrel_size_estimate in costsize.c.
+func (p *planner) joinRows(s relSet) float64 {
+	rows := 1.0
+	var joinQuals []query.Expr
+	for i := range p.rng {
+		if s.has(i) {
+			rows *= p.rows[single(i)]
+		}
+	}
+	for k, q := range p.quals {
+		if p.qrels[k].size() >= 2 && p.qrels[k].subsetOf(s) {
+			joinQuals = append(joinQuals, q)
+		}
+	}
+	return clampRows(rows * p.selectivity(joinQuals, -1))
+}
+
+// materialize costs storing the input's rows: twice cpu_operator_cost
+// per row on top of the input.
+// PostgreSQL: cost_material in costsize.c.
+func materialize(input plan.Node) plan.Node {
+	in := input.Estimate()
+	return &plan.Materialize{Input: input, Est: plan.Estimate{
+		StartupCost: in.StartupCost,
+		TotalCost:   in.TotalCost + 2*CPUOperatorCost*in.Rows,
+		Rows:        in.Rows,
+		Width:       in.Width,
+	}}
+}
+
+// nestLoop costs the outer path once and the inner path once per outer
+// row: a materialised inner is replayed at cpu_operator_cost per row
+// after the first pass, any other inner is run again in full. Each pair
+// then costs a tuple plus the quals.
+// PostgreSQL: initial_cost_nestloop, final_cost_nestloop, and
+// cost_rescan in costsize.c.
+func (p *planner) nestLoop(s relSet, outer, inner path, quals []query.Expr) path {
+	o, in := outer.est(), inner.est()
+	rescanStartup, rescanRun := in.StartupCost, in.TotalCost-in.StartupCost
+	if _, ok := inner.node.(*plan.Materialize); ok {
+		rescanStartup, rescanRun = 0, CPUOperatorCost*in.Rows
+	}
+	startup := o.StartupCost + in.StartupCost
+	run := o.TotalCost - o.StartupCost + in.TotalCost - in.StartupCost
+	if o.Rows > 1 {
+		run += (o.Rows - 1) * (rescanStartup + rescanRun)
+	}
+	run += o.Rows * in.Rows * (CPUTupleCost + CPUOperatorCost*float64(opCount(quals...)))
+	node := &plan.NestLoop{Outer: outer.node, Inner: inner.node, Qual: conjunction(quals), Est: plan.Estimate{
+		StartupCost: startup,
+		TotalCost:   startup + run,
+		Rows:        p.joinRows(s),
+		Width:       o.Width + in.Width,
+	}}
+	return path{node: node, ordered: outer.ordered}
+}
+
+// hashJoin costs reading the whole inner path into the table before
+// the first row, then probing with each outer row: the hash quals on
+// the rows of the bucket, taken as half their cost since most buckets
+// do not match, and a tuple plus the remaining quals per pair passing
+// them.
+// PostgreSQL: initial_cost_hashjoin and final_cost_hashjoin in
+// costsize.c, ExecChooseHashTableSize in nodeHash.c.
+func (p *planner) hashJoin(s relSet, outer, inner path, hashQuals, rest []query.Expr) path {
+	o, in := outer.est(), inner.est()
+	n := float64(len(hashQuals))
+	startup := o.StartupCost + in.TotalCost + (CPUOperatorCost*n+CPUTupleCost)*in.Rows
+	run := o.TotalCost - o.StartupCost + CPUOperatorCost*n*o.Rows
+
+	buckets := float64(nextPow2(uint64(math.Max(math.Ceil(in.Rows), 1024))))
+	bucketSize := 1.0
+	for _, q := range hashQuals {
+		bucketSize = math.Min(bucketSize, p.bucketSize(q.(*query.OpExpr).Right, buckets))
+	}
+	run += CPUOperatorCost * float64(opCount(hashQuals...)) * o.Rows * clampRows(in.Rows*bucketSize) * 0.5
+	matched := clampRows(o.Rows * in.Rows * p.selectivity(hashQuals, -1))
+	run += matched * (CPUTupleCost + CPUOperatorCost*float64(opCount(rest...)))
+
+	hash := &plan.Hash{Input: inner.node, Est: plan.Estimate{
+		StartupCost: in.TotalCost, TotalCost: in.TotalCost, Rows: in.Rows, Width: in.Width}}
+	node := &plan.HashJoin{Outer: outer.node, Inner: hash, HashQuals: hashQuals, Qual: conjunction(rest), Est: plan.Estimate{
+		StartupCost: startup,
+		TotalCost:   startup + run,
+		Rows:        p.joinRows(s),
+		Width:       o.Width + in.Width,
+	}}
+	return path{node: node, ordered: len(p.orderBy) == 0}
+}
+
+func nextPow2(n uint64) uint64 {
+	if n <= 1 {
+		return 1
+	}
+	return 1 << bits.Len64(n-1)
+}
+
+// bucketSize estimates the fraction of the inner rows that share a hash
+// bucket with a given key: one in the number of distinct values of the
+// key, scaled down by the fraction of its table the inner side's quals
+// keep, and at least one in the number of buckets; a tenth when the
+// distinct count is a guess.
+// PostgreSQL: estimate_hash_bucket_stats in selfuncs.c.
+func (p *planner) bucketSize(key query.Expr, buckets float64) float64 {
+	nd, guess := p.ndistinct(key)
+	if guess {
+		return 0.1
+	}
+	if v, ok := key.(*query.Var); ok {
+		_, tuples := relSize(p.rng[v.Rel].Rel)
+		nd = clampRows(nd * p.rows[single(v.Rel)] / tuples)
+	}
+	return math.Min(math.Max(1/math.Min(nd, buckets), 1e-6), 1)
+}
+
+// ndistinct estimates the distinct values of an expression: the table's
+// tuples for a column with a unique index, 2 for a boolean column, the
+// tuples of the expression's one table when there are fewer than
+// DefaultNumDistinct, else DefaultNumDistinct with guess set.
+// PostgreSQL: get_variable_numdistinct in selfuncs.c.
+func (p *planner) ndistinct(e query.Expr) (nd float64, guess bool) {
+	rels := exprRels(e)
+	if rels.size() != 1 {
+		return DefaultNumDistinct, true
+	}
+	rel := p.rng[bits.TrailingZeros64(uint64(rels))].Rel
+	_, tuples := relSize(rel)
+	if v, ok := e.(*query.Var); ok {
+		for _, idx := range rel.Indexes {
+			if idx.Unique && idx.Attr == v.Attr {
+				return tuples, false
+			}
+		}
+		if v.Typ == tuple.Bool {
+			return 2, false
+		}
+	}
+	if tuples < DefaultNumDistinct {
+		return clampRows(tuples), false
+	}
+	return DefaultNumDistinct, true
 }
 
 // Costing.
@@ -322,11 +661,11 @@ func isIndexVar(e query.Expr, idx *catalog.IndexInfo) bool {
 // seqScan costs reading every page once and every tuple through the
 // quals.
 // PostgreSQL: cost_seqscan in costsize.c.
-func seqScan(rel *query.RangeEntry, quals []query.Expr) plan.Node {
+func (p *planner) seqScan(rel *query.RangeEntry, quals []query.Expr) plan.Node {
 	pages, tuples := relSize(rel.Rel)
 	est := plan.Estimate{
 		TotalCost: pages*SeqPageCost + tuples*(CPUTupleCost+CPUOperatorCost*float64(opCount(quals...))),
-		Rows:      clampRows(tuples * selectivity(quals)),
+		Rows:      clampRows(tuples * p.selectivity(quals, rel.Index)),
 		Width:     relWidth(rel.Rel),
 	}
 	return withFilter(&plan.SeqScan{Rel: rel, Est: est}, conjunction(quals), est)
@@ -338,13 +677,13 @@ func seqScan(rel *query.RangeEntry, quals []query.Expr) plan.Node {
 // fetched tuples.
 // PostgreSQL: cost_index in costsize.c, btcostestimate and
 // genericcostestimate in selfuncs.c.
-func indexScan(rel *query.RangeEntry, idx *catalog.IndexInfo, indexQuals, rest []query.Expr) plan.Node {
+func (p *planner) indexScan(rel *query.RangeEntry, idx *catalog.IndexInfo, indexQuals, rest []query.Expr) plan.Node {
 	pages, tuples := relSize(rel.Rel)
 	indexPages, indexTuples := float64(idx.Pages), float64(idx.Tuples)
 	if idx.Pages == 0 {
 		indexPages, indexTuples = 1, tuples
 	}
-	indexSel := selectivity(indexQuals)
+	indexSel := p.selectivity(indexQuals, rel.Index)
 
 	// The index part: descent, then the leaf pages and entries visited.
 	descent := 50 * CPUOperatorCost
@@ -367,7 +706,7 @@ func indexScan(rel *query.RangeEntry, idx *catalog.IndexInfo, indexQuals, rest [
 	est := plan.Estimate{
 		StartupCost: descent,
 		TotalCost:   descent + indexCost + heapCost,
-		Rows:        clampRows(tuples * selectivity(indexQuals) * selectivity(rest)),
+		Rows:        clampRows(tuples * indexSel * p.selectivity(rest, rel.Index)),
 		Width:       relWidth(rel.Rel),
 	}
 	return withFilter(&plan.IndexScan{Rel: rel, Index: idx, Quals: indexQuals, Est: est}, conjunction(rest), est)
@@ -466,11 +805,18 @@ func opCount(exprs ...query.Expr) int {
 	return n
 }
 
+// Selectivity.
+
 // selectivity estimates the fraction of rows that satisfy every qual,
 // with the default selectivities: no column has statistics. Inequalities
-// on the same column are paired into a range.
-// PostgreSQL: clauselist_selectivity in clausesel.c.
-func selectivity(quals []query.Expr) float64 {
+// on the same column are paired into a range. rel is the relation whose
+// scan the quals are for, or -1 at a join: an equality between two
+// relations' columns is a bound of that relation's scan in the first
+// case (one row for a unique column, DefaultEqSel otherwise) and a
+// join qual in the second (joinEqSel).
+// PostgreSQL: clauselist_selectivity in clausesel.c, eqsel and
+// var_eq_non_const in selfuncs.c.
+func (p *planner) selectivity(quals []query.Expr, rel int) float64 {
 	type bounds struct{ lo, hi bool }
 	ranges := map[[2]int]*bounds{}
 	s := 1.0
@@ -479,9 +825,9 @@ func selectivity(quals []query.Expr) float64 {
 		case *query.OpExpr:
 			switch e.Op {
 			case ast.Eq:
-				s *= DefaultEqSel
+				s *= p.eqSel(e, rel)
 			case ast.Ne:
-				s *= 1 - DefaultEqSel
+				s *= 1 - p.eqSel(e, rel)
 			case ast.Lt, ast.Le, ast.Gt, ast.Ge:
 				v, lower, ok := rangeBound(e)
 				if !ok {
@@ -511,16 +857,16 @@ func selectivity(quals []query.Expr) float64 {
 		case *query.BoolExpr:
 			switch e.Op {
 			case query.And:
-				s *= selectivity(e.Args)
+				s *= p.selectivity(e.Args, rel)
 			case query.Or:
 				or := 0.0
 				for _, arg := range e.Args {
-					a := selectivity([]query.Expr{arg})
+					a := p.selectivity([]query.Expr{arg}, rel)
 					or = or + a - or*a
 				}
 				s *= or
 			case query.Not:
-				s *= 1 - selectivity(e.Args)
+				s *= 1 - p.selectivity(e.Args, rel)
 			}
 		default:
 			s *= DefaultBoolSel
@@ -536,37 +882,71 @@ func selectivity(quals []query.Expr) float64 {
 	return math.Min(math.Max(s, 0), 1)
 }
 
+// eqSel is the selectivity of an equality: DefaultEqSel within one
+// relation; between relations, one row when the relation being scanned
+// has a unique index on its side, DefaultEqSel otherwise, and joinEqSel
+// at a join.
+func (p *planner) eqSel(e *query.OpExpr, rel int) float64 {
+	if (exprRels(e.Left) | exprRels(e.Right)).size() < 2 {
+		return DefaultEqSel
+	}
+	if rel < 0 {
+		return p.joinEqSel(e)
+	}
+	for _, side := range []query.Expr{e.Left, e.Right} {
+		if v, ok := side.(*query.Var); ok && v.Rel == rel {
+			for _, idx := range p.rng[rel].Rel.Indexes {
+				if idx.Unique && idx.Attr == v.Attr {
+					_, tuples := relSize(p.rng[rel].Rel)
+					return 1 / tuples
+				}
+			}
+		}
+	}
+	return DefaultEqSel
+}
+
+// joinEqSel is the selectivity of an equality join: each value on the
+// side with fewer distinct values matches one in the other side's
+// distinct count, so one row in the larger count survives.
+// PostgreSQL: eqjoinsel_inner in selfuncs.c.
+func (p *planner) joinEqSel(e *query.OpExpr) float64 {
+	l, _ := p.ndistinct(e.Left)
+	r, _ := p.ndistinct(e.Right)
+	return 1 / math.Max(l, r)
+}
+
 // rangeBound classifies an inequality with a column on one side and no
 // column on the other as a lower or upper bound of that column.
 func rangeBound(e *query.OpExpr) (v *query.Var, lower, ok bool) {
-	if v, ok := e.Left.(*query.Var); ok && !hasVar(e.Right) {
+	if v, ok := e.Left.(*query.Var); ok && exprRels(e.Right) == 0 {
 		return v, e.Op == ast.Gt || e.Op == ast.Ge, true
 	}
-	if v, ok := e.Right.(*query.Var); ok && !hasVar(e.Left) {
+	if v, ok := e.Right.(*query.Var); ok && exprRels(e.Left) == 0 {
 		return v, e.Op == ast.Lt || e.Op == ast.Le, true
 	}
 	return nil, false, false
 }
 
-// hasVar reports whether e references a column.
-func hasVar(e query.Expr) bool {
+// exprRels is the set of relations whose columns e references.
+func exprRels(e query.Expr) relSet {
 	switch x := e.(type) {
 	case *query.Var:
-		return true
+		return single(x.Rel)
 	case *query.OpExpr:
-		return hasVar(x.Left) || hasVar(x.Right)
+		return exprRels(x.Left) | exprRels(x.Right)
 	case *query.BoolExpr:
+		var s relSet
 		for _, arg := range x.Args {
-			if hasVar(arg) {
-				return true
-			}
+			s |= exprRels(arg)
 		}
+		return s
 	case *query.Neg:
-		return hasVar(x.X)
+		return exprRels(x.X)
 	case *query.NullTest:
-		return hasVar(x.X)
+		return exprRels(x.X)
 	case *query.Cast:
-		return hasVar(x.X)
+		return exprRels(x.X)
 	}
-	return false
+	return 0
 }
