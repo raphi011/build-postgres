@@ -208,3 +208,26 @@ two large unanalysed tables one in 200, which is enough for the planner
 to prefer hashing a small table and probing an index of a large one.
 Real distinct counts would come from the sampling pass that histograms
 need, which stays out of scope.
+
+## D23: The commit log is durable per commit; visibility waits a chapter
+
+Chapter 16 gives every statement a real transaction ID and records its
+verdict in `pg_xact`, but leaves the executor's `xmax == 0` rule alone.
+The alternative, a first visibility check against the log without a
+snapshot, would be most of chapter 17's `HeapTupleSatisfiesMVCC` written
+twice, once wrong. So this chapter's tests read tuple headers and log
+bits, and its regression file never selects from a table after a
+rolled-back write; chapter 17 adds the snapshot, the visibility
+function, and the regression output that shows rows vanish.
+
+Two smaller choices follow from having no WAL. The control file is
+rewritten on every `Begin`, as it already was on every `NewOID`, under
+one package-wide lock (`UpdateControl`, PostgreSQL's `ControlFileLock`)
+because both counters share the file. And `Commit` syncs the commit log
+segment itself, because the log is the only durable record of a commit;
+PostgreSQL syncs the WAL and writes the log back at checkpoints. That
+last point is also why the session flushes the buffer pool and syncs the
+relation files before `Commit` writes the bit: a log that vouches for
+pages still in memory is worse than one that says nothing (D11). IDs
+are assigned at `Begin` rather than at the first write, so a `SELECT`
+consumes one; lazy assignment is an optimisation the tests do not need.

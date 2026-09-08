@@ -24,10 +24,23 @@ import (
 	"github.com/raphi011/build-postgres/internal/sql/parser"
 	"github.com/raphi011/build-postgres/internal/sql/query"
 	"github.com/raphi011/build-postgres/internal/tuple"
+	"github.com/raphi011/build-postgres/internal/txn"
 )
 
 // NFrames is the size of a session's buffer pool.
 const NFrames = 256
+
+// ErrInFailedTransaction is the error of every statement but COMMIT and
+// ROLLBACK after an error inside a transaction block (SQLSTATE 25P02).
+var ErrInFailedTransaction = errors.New("session: current transaction is aborted")
+
+// Warnings PostgreSQL issues for transaction control statements that
+// do not match the session's state. Reported in Result.Warnings; the
+// statement still succeeds.
+const (
+	WarnNoTransaction      = "there is no transaction in progress"
+	WarnAlreadyTransaction = "there is already a transaction in progress"
+)
 
 // Session is one connection to a data directory. It is not safe for
 // concurrent use; chapter 17 adds concurrent sessions.
@@ -35,7 +48,14 @@ type Session struct {
 	store *smgr.DataDir
 	pool  *bufmgr.Pool
 	cat   *catalog.Catalog
-	xid   tuple.XID
+	txn   *txn.Manager
+
+	// Transaction state: tx is the current transaction, nil between
+	// statements outside a block; explicit is set between BEGIN and
+	// COMMIT or ROLLBACK; failed is set after an error inside the block.
+	tx       *txn.Transaction
+	explicit bool
+	failed   bool
 }
 
 // Open opens the data directory at dir, bootstrapping it first if it has
@@ -61,8 +81,9 @@ func Open(dir string) (*Session, error) {
 // Catalog returns the session's catalog.
 func (s *Session) Catalog() *catalog.Catalog { return s.cat }
 
-// Close flushes every dirty page and closes the data directory. Returns
-// the first error of the two.
+// Close aborts a transaction left open, flushes every dirty page, and
+// closes the commit log and the data directory. Returns the first error.
+// PostgreSQL: ShutdownPostgres in postinit.c.
 func (s *Session) Close() error {
 	err := s.pool.FlushAll()
 	if cerr := s.store.Close(); err == nil {
@@ -75,6 +96,14 @@ func (s *Session) Close() error {
 // It stops at the first error, returning the results so far and the
 // error, which is always a *Error: Query is the whole of sql, Pos is set
 // for lexer, parser, and analyzer errors, and Err is the original error.
+//
+// Each statement outside a transaction block runs in its own
+// transaction, committed when it succeeds and aborted when it fails.
+// BEGIN opens a block; an error inside it aborts the transaction and
+// every later statement but COMMIT and ROLLBACK fails with
+// ErrInFailedTransaction until one of them ends the block. Every commit,
+// implicit or explicit, flushes the cluster first, so a committed
+// statement survives losing the process without a Close.
 // PostgreSQL: exec_simple_query in postgres.c.
 func (s *Session) Exec(sql string) ([]*Result, error) {
 	stmts, err := parser.Parse(sql)
@@ -469,6 +498,9 @@ type Result struct {
 	Columns []Column
 	Rows    [][]tuple.Datum
 	Footer  []string // lines printed after the rows, as \d prints Indexes:
+	// Warnings are the messages PostgreSQL reports at WARNING level
+	// while running the statement; the statement still succeeded.
+	Warnings []string
 }
 
 // String renders a result set in psql's aligned format, ending with the

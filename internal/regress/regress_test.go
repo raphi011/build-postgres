@@ -99,7 +99,7 @@ func upToChapter(t *testing.T, files []string) []string {
 
 // run feeds src to s the way psql -a -q would: every nonempty input line
 // is echoed as it is read, and each statement runs as soon as its
-// semicolon arrives, printing its result set or error. A
+// semicolon arrives, printing its warnings, its result set or error. A
 // reader error fails the test: it would otherwise look like the end of
 // the file and compare a truncated run against a truncated expectation.
 func run(t *testing.T, s *session.Session, src string) string {
@@ -122,6 +122,9 @@ func run(t *testing.T, s *session.Session, src string) string {
 			buf = rest
 			results, err := s.Exec(stmt)
 			for _, r := range results {
+				for _, w := range r.Warnings {
+					out.WriteString("WARNING:  " + w + "\n")
+				}
 				out.WriteString(r.String())
 			}
 			if err != nil {
