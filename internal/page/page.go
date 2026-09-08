@@ -286,5 +286,21 @@ func (p Page) Compact() {
 // new line pointer does not fit.
 // PostgreSQL: PageAddItemExtended in bufpage.c.
 func (p Page) InsertItem(n OffsetNumber, item []byte) error {
-	panic("not implemented")
+	if len(item) > MaxItemSize {
+		return ErrItemTooLarge
+	}
+	if n < 1 || n > p.NumItems()+1 {
+		return ErrInvalidOffset
+	}
+	lower := int(p.Lower()) + LinePointerSize
+	upper := int(p.Upper()) - align8(len(item))
+	if upper < lower {
+		return ErrNoSpace
+	}
+	copy(p[lpOffset(n)+LinePointerSize:lower], p[lpOffset(n):lpOffset(p.NumItems()+1)])
+	copy(p[upper:], item)
+	p.setU16(offLower, uint16(lower))
+	p.setU16(offUpper, uint16(upper))
+	p.setItemID(n, ItemID{Off: uint16(upper), Len: uint16(len(item)), Flags: ItemNormal})
+	return nil
 }
