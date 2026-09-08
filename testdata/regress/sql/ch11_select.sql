@@ -1,0 +1,24 @@
+-- SELECT: projection, expressions, WHERE, three-valued logic.
+CREATE TABLE t (a int4, b text, c bool);
+INSERT INTO t VALUES (1, 'one', true), (2, 'two', false), (3, NULL, NULL), (4, 'four', true);
+SELECT * FROM t;
+SELECT a, b FROM t;
+SELECT b AS name, a * 10 AS tens, a + 1, -a, a / 2 FROM t;
+SELECT x.b, x.a FROM t AS x;
+SELECT 1, 'text', true, NULL;
+SELECT 1 + 2 * 3, (1 + 2) * 3, 7 / 2, -7 / 2, 3000000000 + 1;
+SELECT * FROM t WHERE a > 2;
+SELECT * FROM t WHERE b = 'two';
+SELECT * FROM t WHERE c;
+SELECT * FROM t WHERE NOT c;
+SELECT * FROM t WHERE c IS NULL;
+SELECT * FROM t WHERE b IS NOT NULL AND a <> 1;
+SELECT * FROM t WHERE a = 1 OR a = 4;
+SELECT * FROM t WHERE b = NULL;
+SELECT * FROM t WHERE a = '3';
+SELECT * FROM t WHERE false;
+SELECT a, c IS NULL, c = true, NOT c, c AND a > 1, c OR a > 1 FROM t;
+SELECT a = 1, a < 2, a >= 3, b < 'one', b = 'four' FROM t;
+SELECT a FROM t WHERE 2147483647 + a > 0;
+SELECT * FROM t WHERE 1 / (a - 2) > 0;
+SELECT count FROM t;

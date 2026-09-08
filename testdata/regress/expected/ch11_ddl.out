@@ -1,0 +1,58 @@
+-- DDL: create and drop tables, and read the catalogs as ordinary tables.
+CREATE TABLE t (a int4 PRIMARY KEY, b text NOT NULL, c bool, d int8);
+CREATE TABLE t (a int4);
+ERROR:  relation "t" already exists
+CREATE TABLE u (a int4, a text);
+ERROR:  column "a" specified more than once
+CREATE TABLE u (a int3);
+ERROR:  type "int3" does not exist
+LINE 1: CREATE TABLE u (a int3);
+                          ^
+SELECT oid, relname, relkind FROM pg_class
+  WHERE oid >= 16384 AND relkind = 'r' ORDER BY oid;
+  oid  | relname | relkind 
+-------+---------+---------
+ 16384 | t       | r
+(1 row)
+
+SELECT attname, atttypid, attnum, attnotnull FROM pg_attribute
+  WHERE attrelid = 16384 ORDER BY attnum;
+ attname | atttypid | attnum | attnotnull 
+---------+----------+--------+------------
+ a       |        1 |      1 | t
+ b       |        4 |      2 | t
+ c       |        3 |      3 | f
+ d       |        2 |      4 | f
+(4 rows)
+
+DROP TABLE t;
+DROP TABLE t;
+ERROR:  table "t" does not exist
+DROP TABLE pg_class;
+ERROR:  permission denied: "pg_class" is a system catalog
+SELECT relname FROM pg_class WHERE oid >= 16384 AND relkind = 'r' ORDER BY oid;
+ relname 
+---------
+(0 rows)
+
+-- The name is free again and the new table gets a new OID.
+CREATE TABLE t (x text);
+SELECT oid > 16384 AS new_oid, relname FROM pg_class WHERE relname = 't';
+ new_oid | relname 
+---------+---------
+ t       | t
+(1 row)
+
+-- Quoted identifiers keep their case.
+CREATE TABLE "Mixed Case" ("Col" int4, col int4);
+INSERT INTO "Mixed Case" VALUES (1, 2);
+SELECT "Col", col FROM "Mixed Case";
+ Col | col 
+-----+-----
+   1 |   2
+(1 row)
+
+SELECT col FROM "mixed case";
+ERROR:  relation "mixed case" does not exist
+LINE 1: SELECT col FROM "mixed case";
+                        ^

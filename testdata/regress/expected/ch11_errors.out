@@ -1,0 +1,111 @@
+-- Error messages and positions.
+CREATE TABLE t (a int4, b text);
+SELEC 1;
+ERROR:  syntax error at or near "SELEC"
+LINE 1: SELEC 1;
+        ^
+SELECT 1 +;
+ERROR:  syntax error at or near ";"
+LINE 1: SELECT 1 +;
+                  ^
+SELECT * FROM;
+ERROR:  syntax error at or near ";"
+LINE 1: SELECT * FROM;
+                     ^
+SELECT a FROM t WHERE;
+ERROR:  syntax error at or near ";"
+LINE 1: SELECT a FROM t WHERE;
+                             ^
+SELECT a FROM t ORDER;
+ERROR:  syntax error at or near ";"
+LINE 1: SELECT a FROM t ORDER;
+                             ^
+SELECT a b c FROM t;
+ERROR:  syntax error at or near "c"
+LINE 1: SELECT a b c FROM t;
+                   ^
+SELECT * FROM nope;
+ERROR:  relation "nope" does not exist
+LINE 1: SELECT * FROM nope;
+                      ^
+SELECT nope FROM t;
+ERROR:  column "nope" does not exist
+LINE 1: SELECT nope FROM t;
+               ^
+SELECT t.nope FROM t;
+ERROR:  column t.nope does not exist
+LINE 1: SELECT t.nope FROM t;
+               ^
+SELECT x.a FROM t;
+ERROR:  missing FROM-clause entry for table "x"
+LINE 1: SELECT x.a FROM t;
+               ^
+SELECT t.a FROM t AS x;
+ERROR:  invalid reference to FROM-clause entry for table "t"
+LINE 1: SELECT t.a FROM t AS x;
+               ^
+SELECT a FROM t, t;
+ERROR:  table name "t" specified more than once
+LINE 1: SELECT a FROM t, t;
+                         ^
+SELECT a FROM t, t AS u;
+ERROR:  column reference "a" is ambiguous
+LINE 1: SELECT a FROM t, t AS u;
+               ^
+SELECT t.a FROM t, t AS u;
+ERROR:  joins are not supported until chapter 15
+SELECT * FROM t WHERE b;
+ERROR:  argument of WHERE must be type boolean, not type text
+LINE 1: SELECT * FROM t WHERE b;
+                              ^
+SELECT a + b FROM t;
+ERROR:  operator does not exist: integer + text
+LINE 1: SELECT a + b FROM t;
+                 ^
+SELECT b > 1 FROM t;
+ERROR:  operator does not exist: text > integer
+LINE 1: SELECT b > 1 FROM t;
+                 ^
+SELECT -b FROM t;
+ERROR:  operator does not exist: - text
+LINE 1: SELECT -b FROM t;
+               ^
+SELECT a AND true FROM t;
+ERROR:  argument of AND must be type boolean, not type integer
+LINE 1: SELECT a AND true FROM t;
+               ^
+SELECT NOT a FROM t;
+ERROR:  argument of NOT must be type boolean, not type integer
+LINE 1: SELECT NOT a FROM t;
+                   ^
+SELECT * WHERE true;
+ERROR:  SELECT * with no tables specified is not valid
+LINE 1: SELECT * WHERE true;
+               ^
+SELECT 1 FROM t LIMIT 'x';
+ERROR:  invalid input syntax for type bigint: "x"
+LINE 1: SELECT 1 FROM t LIMIT 'x';
+                              ^
+SELECT 1 FROM t LIMIT true;
+ERROR:  argument of LIMIT must be type bigint, not type boolean
+LINE 1: SELECT 1 FROM t LIMIT true;
+                              ^
+SELECT 1
+FROM t
+WHERE nope = 1;
+ERROR:  column "nope" does not exist
+LINE 3: WHERE nope = 1;
+              ^
+SELECT 1 / 0;
+ERROR:  division by zero
+SELECT 2147483647 * 2;
+ERROR:  integer out of range
+SELECT -9223372036854775807 - 2;
+ERROR:  bigint out of range
+-- Statements after an error still run.
+SELECT 1;
+ ?column? 
+----------
+        1
+(1 row)
+

@@ -1,0 +1,188 @@
+-- ORDER BY and LIMIT. NULLs sort last ascending and first descending;
+-- text sorts bytewise, as under the C collation: 'B' < 'a' < 'ab' < 'b'.
+CREATE TABLE t (a int4, b text, c bool);
+INSERT INTO t VALUES (3, 'b', true), (1, NULL, false), (4, 'B', NULL),
+  (2, 'a', true), (5, NULL, false), (6, 'ab', true);
+SELECT * FROM t ORDER BY a;
+ a | b  | c 
+---+----+---
+ 1 |    | f
+ 2 | a  | t
+ 3 | b  | t
+ 4 | B  | 
+ 5 |    | f
+ 6 | ab | t
+(6 rows)
+
+SELECT * FROM t ORDER BY a DESC;
+ a | b  | c 
+---+----+---
+ 6 | ab | t
+ 5 |    | f
+ 4 | B  | 
+ 3 | b  | t
+ 2 | a  | t
+ 1 |    | f
+(6 rows)
+
+SELECT * FROM t ORDER BY b, a;
+ a | b  | c 
+---+----+---
+ 4 | B  | 
+ 2 | a  | t
+ 6 | ab | t
+ 3 | b  | t
+ 1 |    | f
+ 5 |    | f
+(6 rows)
+
+SELECT * FROM t ORDER BY b DESC, a;
+ a | b  | c 
+---+----+---
+ 1 |    | f
+ 5 |    | f
+ 3 | b  | t
+ 6 | ab | t
+ 2 | a  | t
+ 4 | B  | 
+(6 rows)
+
+SELECT * FROM t ORDER BY c, a DESC;
+ a | b  | c 
+---+----+---
+ 5 |    | f
+ 1 |    | f
+ 6 | ab | t
+ 3 | b  | t
+ 2 | a  | t
+ 4 | B  | 
+(6 rows)
+
+SELECT * FROM t ORDER BY c DESC, a;
+ a | b  | c 
+---+----+---
+ 4 | B  | 
+ 2 | a  | t
+ 3 | b  | t
+ 6 | ab | t
+ 1 |    | f
+ 5 |    | f
+(6 rows)
+
+SELECT a, b FROM t ORDER BY 2, 1;
+ a | b  
+---+----
+ 4 | B
+ 2 | a
+ 6 | ab
+ 3 | b
+ 1 | 
+ 5 | 
+(6 rows)
+
+SELECT a AS x FROM t ORDER BY x DESC;
+ x 
+---
+ 6
+ 5
+ 4
+ 3
+ 2
+ 1
+(6 rows)
+
+SELECT a, a * -1 AS neg FROM t ORDER BY neg;
+ a | neg 
+---+-----
+ 6 |  -6
+ 5 |  -5
+ 4 |  -4
+ 3 |  -3
+ 2 |  -2
+ 1 |  -1
+(6 rows)
+
+SELECT a FROM t ORDER BY b, a LIMIT 3;
+ a 
+---
+ 4
+ 2
+ 6
+(3 rows)
+
+SELECT a FROM t ORDER BY a LIMIT 0;
+ a 
+---
+(0 rows)
+
+SELECT a FROM t ORDER BY a LIMIT 100;
+ a 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+(6 rows)
+
+SELECT a FROM t ORDER BY a LIMIT NULL;
+ a 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+(6 rows)
+
+SELECT a FROM t ORDER BY a LIMIT '2';
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+SELECT a FROM t ORDER BY a LIMIT 1 + 1;
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+SELECT a FROM t ORDER BY a DESC LIMIT 1;
+ a 
+---
+ 6
+(1 row)
+
+SELECT a FROM t LIMIT 2;
+ a 
+---
+ 3
+ 1
+(2 rows)
+
+SELECT a FROM t ORDER BY a LIMIT -1;
+ERROR:  LIMIT must not be negative
+SELECT a FROM t ORDER BY a LIMIT 'x';
+ERROR:  invalid input syntax for type bigint: "x"
+LINE 1: SELECT a FROM t ORDER BY a LIMIT 'x';
+                                         ^
+SELECT a FROM t ORDER BY a LIMIT a;
+ERROR:  argument of LIMIT must not contain variables
+LINE 1: SELECT a FROM t ORDER BY a LIMIT a;
+                                         ^
+SELECT a FROM t ORDER BY 3;
+ERROR:  ORDER BY position 3 is not in select list
+LINE 1: SELECT a FROM t ORDER BY 3;
+                                 ^
+SELECT a FROM t ORDER BY z;
+ERROR:  column "z" does not exist
+LINE 1: SELECT a FROM t ORDER BY z;
+                                 ^
+SELECT a AS x, b AS x FROM t ORDER BY x;
+ERROR:  ORDER BY "x" is ambiguous
+LINE 1: SELECT a AS x, b AS x FROM t ORDER BY x;
+                                              ^
