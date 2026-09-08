@@ -96,3 +96,27 @@ types, commit). Putting them last in v1 would make the book's final third a
 cross-cutting refactor. v1 ends with a database that is correct under
 concurrent transactions and durable via explicit flushes at commit. v2 opens
 with VACUUM, then WAL, then recovery, all on a stable base.
+
+## D12: Base identifier types live in `internal/tuple`
+
+`OID`, `XID`, `BlockNumber`, and `TID` are defined in the tuple package
+because the tuple header stores them. A separate leaf package would name
+things more precisely but would contain no behaviour.
+
+## D13: Heap methods take an explicit XID from chapter 05
+
+`Insert`, `Delete`, and `Update` accept the transaction ID and store it
+without interpreting it. Chapter 16 supplies real values without changing
+signatures. Chapter 17 adds a snapshot argument to `Scan` and `Fetch`.
+
+## D14: The solution branch merges main
+
+Each chapter on `solution` is a merge of `main` plus one implementation
+commit, tagged `chNN`. A linear rebase would need conflict resolution
+whenever a later chapter edits an earlier skeleton. `git diff ch04 ch05 --
+internal/` is the supported way to view a chapter's delta.
+
+## D15: No CI and no license file
+
+The repository is for personal use. Correctness is checked by running the
+test suite on `solution` before tagging.

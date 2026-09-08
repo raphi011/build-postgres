@@ -51,4 +51,5 @@ recovery, aggregates, the PostgreSQL wire protocol so real `psql` connects.
 
 ## Status
 
-Planning. No chapter content yet.
+Part 1 (chapters 00–05, storage) is written on `main` with a reference
+implementation on `solution`. Part 2 is next.
