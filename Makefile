@@ -1,9 +1,10 @@
 # Chapter targets run the packages of that chapter and every earlier one.
-# Package lists are filled in as chapters land.
 
 GO ?= go
 
-.PHONY: build test vet regress
+CH01 = ./internal/page/...
+
+.PHONY: build test vet regress test-ch01
 
 build:
 	$(GO) build ./...
@@ -17,3 +18,6 @@ test:
 # SQL regression suite (chapter 11+).
 regress:
 	$(GO) test -race ./internal/regress/...
+
+test-ch01:
+	$(GO) test -race $(CH01)
