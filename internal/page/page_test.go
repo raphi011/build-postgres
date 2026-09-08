@@ -491,3 +491,61 @@ func TestRandomOperations(t *testing.T) {
 		}
 	}
 }
+
+func TestInsertItem(t *testing.T) {
+	p := New(0)
+	for _, it := range []string{"a", "b", "c"} {
+		if _, err := p.AddItem([]byte(it)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	free := p.FreeSpace()
+	if err := p.InsertItem(2, []byte("x")); err != nil {
+		t.Fatalf("InsertItem(2): %v", err)
+	}
+	if err := p.InsertItem(5, []byte("y")); err != nil {
+		t.Fatalf("InsertItem(5): %v", err)
+	}
+	if err := p.InsertItem(1, []byte("w")); err != nil {
+		t.Fatalf("InsertItem(1): %v", err)
+	}
+	want := []string{"w", "a", "x", "b", "c", "y"}
+	if p.NumItems() != OffsetNumber(len(want)) {
+		t.Fatalf("NumItems = %d, want %d", p.NumItems(), len(want))
+	}
+	for i, w := range want {
+		got, err := p.GetItem(OffsetNumber(i + 1))
+		if err != nil || string(got) != w {
+			t.Errorf("item %d = %q (%v), want %q", i+1, got, err, w)
+		}
+	}
+	// Three items of 8 aligned bytes plus three line pointers.
+	if got := p.FreeSpace(); got != free-3*(8+LinePointerSize) {
+		t.Errorf("FreeSpace = %d, want %d", got, free-3*(8+LinePointerSize))
+	}
+	for _, n := range []OffsetNumber{0, 8} {
+		if err := p.InsertItem(n, []byte("z")); !errors.Is(err, ErrInvalidOffset) {
+			t.Errorf("InsertItem(%d) = %v, want ErrInvalidOffset", n, err)
+		}
+	}
+	if err := p.InsertItem(1, make([]byte, MaxItemSize+1)); !errors.Is(err, ErrItemTooLarge) {
+		t.Errorf("oversized item: %v, want ErrItemTooLarge", err)
+	}
+	if err := p.InsertItem(1, make([]byte, p.FreeSpace()+1)); !errors.Is(err, ErrNoSpace) {
+		t.Errorf("item past free space: %v, want ErrNoSpace", err)
+	}
+	if err := p.InsertItem(1, make([]byte, p.FreeSpace()&^7)); err != nil {
+		t.Errorf("item filling free space: %v", err)
+	}
+	// Unused line pointers are not reused: the new item is renumbered in.
+	p = New(0)
+	p.AddItem([]byte("a"))
+	p.AddItem([]byte("b"))
+	p.DeleteItem(1)
+	if err := p.InsertItem(1, []byte("c")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := p.GetItem(1); string(got) != "c" || p.NumItems() != 3 || p.ItemID(2).Flags != ItemUnused {
+		t.Errorf("after insert over an unused pointer: item 1 %q, %d items, item 2 flags %v", got, p.NumItems(), p.ItemID(2).Flags)
+	}
+}

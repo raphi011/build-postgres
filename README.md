@@ -53,5 +53,6 @@ recovery, aggregates, the PostgreSQL wire protocol so real `psql` connects.
 
 Parts 1 to 3 (chapters 00–11: storage, SQL front end, expression
 evaluation, executor, and a working REPL with the SQL regression suite)
-are written on `main` with a reference implementation on `solution`.
-Part 4 (B-tree, index integration) is next.
+and chapter 12 (the on-disk B-tree) are written on `main` with a
+reference implementation on `solution`. Chapter 13 (index integration)
+is next.

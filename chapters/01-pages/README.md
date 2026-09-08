@@ -236,6 +236,7 @@ func (p Page) NumItems() OffsetNumber
 func (p Page) ItemID(n OffsetNumber) ItemID
 func (p Page) FreeSpace() int
 func (p Page) AddItem(item []byte) (OffsetNumber, error)
+func (p Page) InsertItem(n OffsetNumber, item []byte) error // added by chapter 12
 func (p Page) GetItem(n OffsetNumber) ([]byte, error)
 func (p Page) DeleteItem(n OffsetNumber) error
 func (p Page) Compact()
@@ -248,6 +249,11 @@ Semantics the tests depend on:
   item plus (if needed) a new line pointer does not fit between `lower` and
   `upper`, and `ErrItemTooLarge` if the item could never fit on an empty
   page. An empty item is allowed.
+- `InsertItem` (chapter 12, for B-tree pages that keep items in key
+  order) stores the item as item `n`, `1..NumItems()+1`, moving the line
+  pointers from `n` on up by one; it never reuses an unused line pointer
+  and returns `ErrInvalidOffset` for any other `n`. This is `PageAddItem`
+  with an offset number.
 - `GetItem` returns a slice aliasing the page, not a copy. It returns
   `ErrInvalidOffset` for item numbers outside `1..NumItems()` and
   `ErrItemUnused` for a deleted item.
