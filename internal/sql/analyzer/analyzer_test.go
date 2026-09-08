@@ -33,6 +33,7 @@ var cat = fakeCatalog{
 		tuple.Attr{Name: "a", Type: tuple.Int4},
 		tuple.Attr{Name: "d", Type: tuple.Int8},
 	)},
+	"t_pkey": {OID: 16386, Name: "t_pkey", Kind: catalog.RelKindIndex, Desc: tuple.NewDesc()},
 }
 
 func analyze(t *testing.T, src string) (query.Stmt, error) {
@@ -276,6 +277,14 @@ CreateTable x (id int4 NOT NULL PRIMARY KEY, name text NOT NULL, ok bool)`},
 CreateTable x (a int8)`},
 	{"drop table x", `
 DropTable x`},
+	{"create index i on t (a)", `
+CreateIndex i ON t (16384) (a)`},
+	{"create unique index i on t (b)", `
+CreateIndex i ON t (16384) (b) UNIQUE`},
+	{`create index "I" on t (c)`, `
+CreateIndex "I" ON t (16384) (c)`},
+	{"drop index i", `
+DropIndex i`},
 	{"begin", `
 Begin`},
 	{"commit", `
@@ -481,6 +490,16 @@ func TestErrors(t *testing.T) {
 
 		// DDL.
 		{"create table x (a int4 primary key, b int4 primary key)", ErrTableDefinition, `multiple primary keys for table "x" are not allowed`, 0},
+		{"create index i on nope (a)", ErrUndefinedTable, `relation "nope" does not exist`, 0},
+		{"create index i on t_pkey (a)", ErrWrongObjectType, `"t_pkey" is an index`, 0},
+		{"create index i on t (nope)", ErrUndefinedColumn, `column "nope" does not exist`, 0},
+
+		// An index is not a table.
+		{"select * from t_pkey", ErrWrongObjectType, `"t_pkey" is an index`, 15},
+		{"select 1 from t join t_pkey on true", ErrWrongObjectType, `"t_pkey" is an index`, 22},
+		{"insert into t_pkey values (1)", ErrWrongObjectType, `"t_pkey" is an index`, 13},
+		{"update t_pkey set a = 1", ErrWrongObjectType, `"t_pkey" is an index`, 8},
+		{"delete from t_pkey", ErrWrongObjectType, `"t_pkey" is an index`, 13},
 
 		// EXPLAIN analyzes its statement.
 		{"explain select x from t", ErrUndefinedColumn, `column "x" does not exist`, 16},
@@ -551,6 +570,8 @@ func TestStmtKinds(t *testing.T) {
 		{"delete from t", &query.Delete{}},
 		{"create table x (a int4)", &query.CreateTable{}},
 		{"drop table t", &query.DropTable{}},
+		{"create index i on t (a)", &query.CreateIndex{}},
+		{"drop index i", &query.DropIndex{}},
 		{"begin", &query.Begin{}},
 		{"commit", &query.Commit{}},
 		{"rollback", &query.Rollback{}},
@@ -582,6 +603,10 @@ func typeName(v any) string {
 		return "CreateTable"
 	case *query.DropTable:
 		return "DropTable"
+	case *query.CreateIndex:
+		return "CreateIndex"
+	case *query.DropIndex:
+		return "DropIndex"
 	case *query.Begin:
 		return "Begin"
 	case *query.Commit:

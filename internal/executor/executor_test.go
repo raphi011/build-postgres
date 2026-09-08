@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
 	"github.com/raphi011/build-postgres/internal/heap"
+	"github.com/raphi011/build-postgres/internal/index"
 	"github.com/raphi011/build-postgres/internal/plan"
 	"github.com/raphi011/build-postgres/internal/smgr"
 	"github.com/raphi011/build-postgres/internal/sql/ast"
@@ -529,5 +532,398 @@ func TestDelete(t *testing.T) {
 	}
 	if _, n, err = Exec(all, d.env); err != nil || n != 0 {
 		t.Fatalf("delete from empty: n=%d err=%v", n, err)
+	}
+}
+
+// Indexes (chapter 13).
+
+// index creates an index on column attr of rel and reloads rel.Rel so
+// that the executor sees it.
+func (d *db) index(t *testing.T, rel *query.RangeEntry, name string, attr int, unique bool) *catalog.IndexInfo {
+	t.Helper()
+	if _, err := d.cat.CreateIndex(name, rel.Rel.OID, attr, unique, false, tuple.FrozenXID); err != nil {
+		t.Fatal(err)
+	}
+	info, err := d.cat.Lookup(rel.Rel.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel.Rel = info
+	idx, err := d.cat.LookupIndex(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return idx
+}
+
+// indexTIDs returns the heap TIDs an index holds, in index order, after
+// checking its structure.
+func (d *db) indexTIDs(t *testing.T, rel *query.RangeEntry, idx *catalog.IndexInfo) []tuple.TID {
+	t.Helper()
+	tree := index.Open(d.env.Pool, rel.Rel, idx)
+	if err := tree.Check(); err != nil {
+		t.Fatalf("Check(%s): %v", idx.Name, err)
+	}
+	s := tree.Scan(nil, nil)
+	defer s.Close()
+	var tids []tuple.TID
+	for s.Next() {
+		tids = append(tids, s.TID())
+	}
+	if err := s.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return tids
+}
+
+// sortedTIDs returns the TIDs of the rows of p ordered by column attr,
+// NULLs last, ties by TID: what an index over attr must hold.
+func (d *db) sortedTIDs(t *testing.T, p plan.Node, attr int) []tuple.TID {
+	t.Helper()
+	rows, _, err := Exec(p, d.env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		switch {
+		case a.Nulls[attr] != b.Nulls[attr]:
+			return b.Nulls[attr]
+		case !a.Nulls[attr]:
+			if c := expr.Compare(a.Values[attr], b.Values[attr]); c != 0 {
+				return c < 0
+			}
+		}
+		if rows[i].TID.Block != rows[j].TID.Block {
+			return rows[i].TID.Block < rows[j].TID.Block
+		}
+		return rows[i].TID.Off < rows[j].TID.Off
+	})
+	tids := make([]tuple.TID, len(rows))
+	for i, r := range rows {
+		tids[i] = r.TID
+	}
+	return tids
+}
+
+func insertPlan(rel *query.RangeEntry, rows ...[]query.Expr) *plan.ModifyTable {
+	return &plan.ModifyTable{Op: plan.Insert, Rel: rel, Input: &plan.Values{Rows: rows}}
+}
+
+func TestInsertMaintainsIndexes(t *testing.T) {
+	d := newDB(t)
+	ia := d.index(t, d.t, "t_a", 0, false)
+	ib := d.index(t, d.t, "t_b", 1, false)
+	ins := insertPlan(d.t,
+		[]query.Expr{i4(3), str("c"), &query.Const{Typ: tuple.Bool, Value: true}},
+		[]query.Expr{i4(1), null(tuple.Text), null(tuple.Bool)},
+		[]query.Expr{i4(2), str("a"), null(tuple.Bool)},
+		[]query.Expr{i4(2), str("b"), null(tuple.Bool)},
+	)
+	if _, n, err := Exec(ins, d.env); err != nil || n != 4 {
+		t.Fatalf("insert: n=%d err=%v", n, err)
+	}
+	scan := &plan.SeqScan{Rel: d.t}
+	if got, want := d.indexTIDs(t, d.t, ia), d.sortedTIDs(t, scan, 0); !reflect.DeepEqual(got, want) {
+		t.Errorf("t_a TIDs = %v, want %v", got, want)
+	}
+	if got, want := d.indexTIDs(t, d.t, ib), d.sortedTIDs(t, scan, 1); !reflect.DeepEqual(got, want) {
+		t.Errorf("t_b TIDs = %v, want %v", got, want)
+	}
+	// Many pages: every row is still found through the index.
+	var rows [][]query.Expr
+	for i := 0; i < 500; i++ {
+		rows = append(rows, []query.Expr{i4(int32(1000 - i)), str(strings.Repeat("x", 300)), null(tuple.Bool)})
+	}
+	if _, n, err := Exec(insertPlan(d.t, rows...), d.env); err != nil || n != 500 {
+		t.Fatalf("insert 500: n=%d err=%v", n, err)
+	}
+	if got, want := d.indexTIDs(t, d.t, ia), d.sortedTIDs(t, scan, 0); !reflect.DeepEqual(got, want) {
+		t.Errorf("t_a after 500 rows: %d TIDs, want %d", len(got), len(want))
+	}
+}
+
+func TestUpdateMaintainsIndexes(t *testing.T) {
+	d := newDB(t)
+	ia := d.index(t, d.t, "t_a", 0, false)
+	d.seed(t, d.t, threeRows...)
+	for _, idx := range d.t.Rel.Indexes {
+		if err := index.Build(d.env.Pool, d.t.Rel, idx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scan := &plan.SeqScan{Rel: d.t}
+	upd := &plan.ModifyTable{Op: plan.Update, Rel: d.t,
+		Input: &plan.Filter{Input: scan, Qual: op(ast.Gt, col(d.t, 0), i4(1))},
+		Set:   []query.Assignment{{Attr: 0, Value: op(ast.Add, col(d.t, 0), i4(10))}}}
+	if _, n, err := Exec(upd, d.env); err != nil || n != 2 {
+		t.Fatalf("update: n=%d err=%v", n, err)
+	}
+	// The new versions are indexed; the old entries stay behind, pointing
+	// at the dead tuples (PostgreSQL leaves them for VACUUM).
+	got := d.indexTIDs(t, d.t, ia)
+	live := d.sortedTIDs(t, scan, 0)
+	if len(got) != 5 {
+		t.Fatalf("index has %d entries after update, want 5", len(got))
+	}
+	if !reflect.DeepEqual(got[:1], live[:1]) || !reflect.DeepEqual(got[3:], live[1:]) {
+		t.Errorf("index TIDs %v, live rows in key order %v", got, live)
+	}
+	h := heap.Open(d.env.Pool, d.t.Rel.OID, d.t.Rel.Desc)
+	for _, tid := range got[1:3] {
+		tup, err := h.Fetch(tid)
+		if err != nil || tup.Xmax() == 0 {
+			t.Errorf("entry %v: expected a dead tuple, got xmax %d err %v", tid, tup.Xmax(), err)
+		}
+	}
+}
+
+func TestDeleteLeavesIndexEntries(t *testing.T) {
+	d := newDB(t)
+	ia := d.index(t, d.t, "t_a", 0, false)
+	tids := d.seed(t, d.t, threeRows...)
+	if err := index.Build(d.env.Pool, d.t.Rel, ia); err != nil {
+		t.Fatal(err)
+	}
+	del := &plan.ModifyTable{Op: plan.Delete, Rel: d.t,
+		Input: &plan.Filter{Input: &plan.SeqScan{Rel: d.t}, Qual: op(ast.Eq, col(d.t, 0), i4(2))}}
+	if _, n, err := Exec(del, d.env); err != nil || n != 1 {
+		t.Fatalf("delete: n=%d err=%v", n, err)
+	}
+	if got := d.indexTIDs(t, d.t, ia); !reflect.DeepEqual(got, tids) {
+		t.Errorf("index TIDs after delete = %v, want %v", got, tids)
+	}
+	// The index scan skips the dead tuple.
+	is := &plan.IndexScan{Rel: d.t, Index: ia}
+	if got := d.dump(t, is); got != "1,one,true\n3,three,NULL\n" {
+		t.Errorf("index scan after delete:\n%s", got)
+	}
+}
+
+func TestUniqueViolation(t *testing.T) {
+	d := newDB(t)
+	ia := d.index(t, d.t, "t_a_key", 0, true)
+	ib := d.index(t, d.t, "t_b", 1, false)
+	if _, _, err := Exec(insertPlan(d.t, []query.Expr{i4(1), str("one"), null(tuple.Bool)}), d.env); err != nil {
+		t.Fatal(err)
+	}
+	scan := &plan.SeqScan{Rel: d.t}
+	before := d.dump(t, scan)
+	entries := len(d.indexTIDs(t, d.t, ia))
+
+	// A duplicate insert fails with PostgreSQL's message and writes
+	// nothing: no heap tuple, no index entry in any index.
+	_, _, err := Exec(insertPlan(d.t, []query.Expr{i4(1), str("uno"), null(tuple.Bool)}), d.env)
+	var e *index.Error
+	if !errors.As(err, &e) || !errors.Is(err, index.ErrUniqueViolation) {
+		t.Fatalf("duplicate insert: %v, want *index.Error wrapping ErrUniqueViolation", err)
+	}
+	if want := `duplicate key value violates unique constraint "t_a_key"`; e.Msg != want {
+		t.Errorf("message %q, want %q", e.Msg, want)
+	}
+	if got := d.dump(t, scan); got != before {
+		t.Errorf("table changed by a failed insert:\n%s", got)
+	}
+	if n := len(d.indexTIDs(t, d.t, ia)); n != entries {
+		t.Errorf("unique index has %d entries, want %d", n, entries)
+	}
+	if n := len(d.indexTIDs(t, d.t, ib)); n != entries {
+		t.Errorf("other index has %d entries, want %d", n, entries)
+	}
+
+	// A multi-row insert keeps the rows before the bad one: there is no
+	// rollback until chapter 16.
+	_, _, err = Exec(insertPlan(d.t,
+		[]query.Expr{i4(2), str("two"), null(tuple.Bool)},
+		[]query.Expr{i4(1), str("dup"), null(tuple.Bool)},
+		[]query.Expr{i4(3), str("three"), null(tuple.Bool)},
+	), d.env)
+	if !errors.Is(err, index.ErrUniqueViolation) {
+		t.Fatalf("multi-row insert: %v", err)
+	}
+	if got := d.dump(t, scan); got != "1,one,NULL\n2,two,NULL\n" {
+		t.Errorf("after failed multi-row insert:\n%s", got)
+	}
+
+	// UPDATE to a taken key fails and changes nothing; to the row's own
+	// key it succeeds (the old version is not a conflict).
+	upd := func(set query.Expr, where query.Expr) error {
+		_, _, err := Exec(&plan.ModifyTable{Op: plan.Update, Rel: d.t,
+			Input: &plan.Filter{Input: scan, Qual: where},
+			Set:   []query.Assignment{{Attr: 0, Value: set}}}, d.env)
+		return err
+	}
+	if err := upd(i4(1), op(ast.Eq, col(d.t, 0), i4(2))); !errors.Is(err, index.ErrUniqueViolation) {
+		t.Fatalf("update to a taken key: %v", err)
+	}
+	if got := d.dump(t, scan); got != "1,one,NULL\n2,two,NULL\n" {
+		t.Errorf("after failed update:\n%s", got)
+	}
+	if err := upd(i4(2), op(ast.Eq, col(d.t, 0), i4(2))); err != nil {
+		t.Fatalf("update to own key: %v", err)
+	}
+	if err := upd(op(ast.Add, col(d.t, 0), i4(10)), op(ast.Eq, col(d.t, 0), i4(2))); err != nil {
+		t.Fatalf("update to a free key: %v", err)
+	}
+	if got := d.dump(t, scan); got != "1,one,NULL\n12,two,NULL\n" {
+		t.Errorf("after updates:\n%s", got)
+	}
+	// A deleted key is free again; NULL keys never conflict.
+	if _, _, err := Exec(&plan.ModifyTable{Op: plan.Delete, Rel: d.t,
+		Input: &plan.Filter{Input: scan, Qual: op(ast.Eq, col(d.t, 0), i4(1))}}, d.env); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Exec(insertPlan(d.t, []query.Expr{i4(1), str("again"), null(tuple.Bool)}), d.env); err != nil {
+		t.Errorf("reinsert of a deleted key: %v", err)
+	}
+	u := d.create(t, "u", tuple.NewDesc(tuple.Attr{Name: "x", Type: tuple.Int4}))
+	d.index(t, u, "u_x_key", 0, true)
+	if _, n, err := Exec(insertPlan(u, []query.Expr{null(tuple.Int4)}, []query.Expr{null(tuple.Int4)}), d.env); err != nil || n != 2 {
+		t.Errorf("two NULL keys: n=%d err=%v", n, err)
+	}
+}
+
+// TestIndexRowTooLarge: a value the heap accepts but the index cannot
+// hold is refused before the heap write, so heap and index stay in step.
+func TestIndexRowTooLarge(t *testing.T) {
+	d := newDB(t)
+	ib := d.index(t, d.t, "t_b", 1, false)
+	long := str(strings.Repeat("x", 3000))
+	_, _, err := Exec(insertPlan(d.t, []query.Expr{i4(1), long, null(tuple.Bool)}), d.env)
+	var e *index.Error
+	if !errors.As(err, &e) || !errors.Is(err, index.ErrTooLarge) {
+		t.Fatalf("oversized insert: %v, want *index.Error wrapping ErrTooLarge", err)
+	}
+	if want := `index row size 3012 exceeds btree version 4 maximum 2704 for index "t_b"`; e.Msg != want {
+		t.Errorf("message %q, want %q", e.Msg, want)
+	}
+	scan := &plan.SeqScan{Rel: d.t}
+	if got := d.dump(t, scan); got != "" {
+		t.Errorf("heap after refused insert:\n%s", got)
+	}
+	if n := len(d.indexTIDs(t, d.t, ib)); n != 0 {
+		t.Errorf("index has %d entries after refused insert", n)
+	}
+	// The same on UPDATE: the old row stays.
+	if _, _, err := Exec(insertPlan(d.t, []query.Expr{i4(1), str("short"), null(tuple.Bool)}), d.env); err != nil {
+		t.Fatal(err)
+	}
+	upd := &plan.ModifyTable{Op: plan.Update, Rel: d.t, Input: scan,
+		Set: []query.Assignment{{Attr: 1, Value: long}}}
+	if _, _, err := Exec(upd, d.env); !errors.Is(err, index.ErrTooLarge) {
+		t.Fatalf("oversized update: %v", err)
+	}
+	if got := d.dump(t, scan); got != "1,short,NULL\n" {
+		t.Errorf("heap after refused update:\n%s", got)
+	}
+	if got, want := d.indexTIDs(t, d.t, ib), d.sortedTIDs(t, scan, 1); !reflect.DeepEqual(got, want) {
+		t.Errorf("index TIDs after refused update = %v, want %v", got, want)
+	}
+}
+
+func TestIndexScan(t *testing.T) {
+	d := newDB(t)
+	ia := d.index(t, d.t, "t_a", 0, false)
+	ib := d.index(t, d.t, "t_b", 1, false)
+	ins := insertPlan(d.t,
+		[]query.Expr{i4(3), str("c"), &query.Const{Typ: tuple.Bool, Value: true}},
+		[]query.Expr{i4(1), null(tuple.Text), null(tuple.Bool)},
+		[]query.Expr{i4(2), str("a"), null(tuple.Bool)},
+		[]query.Expr{i4(2), str("b"), null(tuple.Bool)},
+		[]query.Expr{i4(4), str("a"), null(tuple.Bool)},
+	)
+	if _, _, err := Exec(ins, d.env); err != nil {
+		t.Fatal(err)
+	}
+	a, b := col(d.t, 0), col(d.t, 1)
+	cases := []struct {
+		name  string
+		index *catalog.IndexInfo
+		quals []query.Expr
+		want  string
+	}{
+		{"a = 2", ia, []query.Expr{op(ast.Eq, a, i4(2))}, "2,a,NULL\n2,b,NULL\n"},
+		{"a = 9", ia, []query.Expr{op(ast.Eq, a, i4(9))}, ""},
+		{"a > 1", ia, []query.Expr{op(ast.Gt, a, i4(1))}, "2,a,NULL\n2,b,NULL\n3,c,true\n4,a,NULL\n"},
+		{"a >= 2 and a < 3", ia, []query.Expr{op(ast.Ge, a, i4(2)), op(ast.Lt, a, i4(3))}, "2,a,NULL\n2,b,NULL\n"},
+		{"a <= 2", ia, []query.Expr{op(ast.Le, a, i4(2))}, "1,NULL,NULL\n2,a,NULL\n2,b,NULL\n"},
+		{"a < 1", ia, []query.Expr{op(ast.Lt, a, i4(1))}, ""},
+		// Several bounds on one side tighten each other.
+		{"a > 1 and a > 2", ia, []query.Expr{op(ast.Gt, a, i4(1)), op(ast.Gt, a, i4(2))}, "3,c,true\n4,a,NULL\n"},
+		{"a >= 3 and a > 2", ia, []query.Expr{op(ast.Ge, a, i4(3)), op(ast.Gt, a, i4(2))}, "3,c,true\n4,a,NULL\n"},
+		{"a < 3 and a <= 3", ia, []query.Expr{op(ast.Lt, a, i4(3)), op(ast.Le, a, i4(3))}, "1,NULL,NULL\n2,a,NULL\n2,b,NULL\n"},
+		{"a >= 3 and a <= 2", ia, []query.Expr{op(ast.Ge, a, i4(3)), op(ast.Le, a, i4(2))}, ""},
+		// The right-hand side is any Var-free expression.
+		{"a = 1 + 1", ia, []query.Expr{op(ast.Eq, a, op(ast.Add, i4(1), i4(1)))}, "2,a,NULL\n2,b,NULL\n"},
+		// A NULL bound matches nothing.
+		{"a = null", ia, []query.Expr{op(ast.Eq, a, null(tuple.Int4))}, ""},
+		{"a > null", ia, []query.Expr{op(ast.Gt, a, null(tuple.Int4))}, ""},
+		// Text keys.
+		{"b = 'a'", ib, []query.Expr{op(ast.Eq, b, str("a"))}, "2,a,NULL\n4,a,NULL\n"},
+		{"b > 'a'", ib, []query.Expr{op(ast.Gt, b, str("a"))}, "2,b,NULL\n3,c,true\n"},
+		// No quals: the whole index in key order, NULL keys last.
+		{"all by a", ia, nil, "1,NULL,NULL\n2,a,NULL\n2,b,NULL\n3,c,true\n4,a,NULL\n"},
+		{"all by b", ib, nil, "2,a,NULL\n4,a,NULL\n2,b,NULL\n3,c,true\n1,NULL,NULL\n"},
+	}
+	for _, c := range cases {
+		if got := d.dump(t, &plan.IndexScan{Rel: d.t, Index: c.index, Quals: c.quals}); got != c.want {
+			t.Errorf("index scan %s =\n%s\nwant\n%s", c.name, got, c.want)
+		}
+	}
+	// Rows carry their heap TIDs, like a Seq Scan's.
+	rows, _, _ := Exec(&plan.IndexScan{Rel: d.t, Index: ia, Quals: []query.Expr{op(ast.Eq, a, i4(3))}}, d.env)
+	if len(rows) != 1 || rows[0].TID != (tuple.TID{Block: 0, Off: 1}) {
+		t.Errorf("index scan rows = %+v", rows)
+	}
+	// Filter over an index scan.
+	f := &plan.Filter{Input: &plan.IndexScan{Rel: d.t, Index: ia, Quals: []query.Expr{op(ast.Ge, a, i4(2))}},
+		Qual: op(ast.Eq, b, str("a"))}
+	if got := d.dump(t, f); got != "2,a,NULL\n4,a,NULL\n" {
+		t.Errorf("filter over index scan:\n%s", got)
+	}
+	// An empty index.
+	e := d.create(t, "e", tDesc)
+	ie := d.index(t, e, "e_a", 0, false)
+	if got := d.dump(t, &plan.IndexScan{Rel: e, Index: ie}); got != "" {
+		t.Errorf("scan of empty index = %q", got)
+	}
+	// An evaluation error in a bound stops the scan.
+	_, _, err := Exec(&plan.IndexScan{Rel: d.t, Index: ia, Quals: []query.Expr{op(ast.Eq, a, op(ast.Div, i4(1), i4(0)))}}, d.env)
+	if !errors.Is(err, expr.ErrDivisionByZero) {
+		t.Errorf("bound 1/0: %v, want ErrDivisionByZero", err)
+	}
+}
+
+// TestUpdateThroughIndexScan: the new tuple versions an UPDATE appends
+// get index entries the scan has not reached yet; each row must still be
+// updated once.
+func TestUpdateThroughIndexScan(t *testing.T) {
+	d := newDB(t)
+	ia := d.index(t, d.t, "t_a", 0, false)
+	var rows [][]query.Expr
+	for i := 0; i < 20; i++ {
+		rows = append(rows, []query.Expr{i4(int32(i)), str(strings.Repeat("x", 1000)), null(tuple.Bool)})
+	}
+	if _, _, err := Exec(insertPlan(d.t, rows...), d.env); err != nil {
+		t.Fatal(err)
+	}
+	upd := &plan.ModifyTable{Op: plan.Update, Rel: d.t,
+		Input: &plan.IndexScan{Rel: d.t, Index: ia, Quals: []query.Expr{op(ast.Ge, col(d.t, 0), i4(0))}},
+		Set:   []query.Assignment{{Attr: 0, Value: op(ast.Add, col(d.t, 0), i4(100))}}}
+	_, n, err := Exec(upd, d.env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 20 {
+		t.Errorf("update processed %d rows, want 20", n)
+	}
+	got, _, _ := Exec(&plan.IndexScan{Rel: d.t, Index: ia}, d.env)
+	for i, r := range got {
+		if a := r.Values[0].(int32); a != int32(100+i) {
+			t.Fatalf("row %d: a = %d, want %d", i, a, 100+i)
+		}
+	}
+	if len(got) != 20 {
+		t.Errorf("%d rows after update, want 20", len(got))
 	}
 }

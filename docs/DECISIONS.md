@@ -157,3 +157,21 @@ parser and an unknown type name is a parse error (`ErrUnknownType`)
 rather than an analysis error. `Parse` returns every statement in the
 input, separated by semicolons, so the regression runner (chapter 11) can
 hand it a whole file; the REPL passes one statement at a time.
+
+## D20: The executor maintains indexes; the unique check precedes the write
+
+`CREATE INDEX` is split between two layers: `catalog.CreateIndex` records
+the index and creates an empty tree, and `index.Build` fills it, so a
+failed build (duplicates under a unique index) is undone by dropping the
+index again. DML goes through `internal/index` from `ModifyTable`
+(`ExecInsertIndexTuples` in PostgreSQL): every insert and update adds an
+entry to every index of the table, a delete leaves its entry behind, and
+an index scan checks the heap tuple's visibility. The unique check runs
+before the heap tuple is written, unlike PostgreSQL, which inserts the
+heap tuple first and relies on the transaction abort to remove it: there
+is no rollback until chapter 16, and a violation must leave nothing
+behind. For the same reason the size limit of an index tuple is checked
+there too (`index.Check`), so that `index.Insert` cannot fail after the
+heap write. Index scans exist as an executor node from this chapter; the
+planner keeps choosing sequential scans until chapter 14 has statistics
+to choose with.

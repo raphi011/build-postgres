@@ -381,3 +381,25 @@ func (e *NullTest) String() string {
 	}
 	return "(" + e.X.String() + " IS NULL)"
 }
+
+// CreateIndex is a bound CREATE INDEX: the table resolved and the key
+// column as a 0-based attribute number.
+type CreateIndex struct {
+	Name   string
+	Rel    *catalog.RelationInfo
+	Attr   int
+	Unique bool
+}
+
+// DropIndex is a bound DROP INDEX.
+type DropIndex struct {
+	Name string
+}
+
+func (*CreateIndex) stmtNode() {}
+func (*DropIndex) stmtNode()   {}
+
+// CreateIndex dumps as "CreateIndex i ON t (16384) (a)", followed by
+// " UNIQUE" for a unique index; DropIndex as "DropIndex i".
+func (s *CreateIndex) String() string { panic("not implemented") }
+func (s *DropIndex) String() string   { panic("not implemented") }

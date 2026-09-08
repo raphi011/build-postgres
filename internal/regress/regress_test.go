@@ -3,6 +3,8 @@
 // output, formatted like psql -a -q, is compared with
 // testdata/regress/expected/<name>.out. Run with -update to rewrite the
 // expected files; actual output always goes to testdata/regress/results.
+// With REGRESS_CHAPTER=NN in the environment only the files of chapters
+// up to NN run, which is what make test-chNN sets.
 package regress
 
 import (
@@ -30,6 +32,7 @@ func TestRegress(t *testing.T) {
 	if len(files) == 0 {
 		t.Fatal("no regression files")
 	}
+	files = upToChapter(t, files)
 	if err := os.MkdirAll(filepath.Join(root, "results"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -67,6 +70,31 @@ func TestRegress(t *testing.T) {
 			}
 		})
 	}
+}
+
+// upToChapter drops the files of chapters after REGRESS_CHAPTER, when
+// it is set. File names start with chNN_.
+func upToChapter(t *testing.T, files []string) []string {
+	limit := os.Getenv("REGRESS_CHAPTER")
+	if limit == "" {
+		return files
+	}
+	last, err := strconv.Atoi(limit)
+	if err != nil {
+		t.Fatalf("REGRESS_CHAPTER=%q: %v", limit, err)
+	}
+	var kept []string
+	for _, file := range files {
+		name := filepath.Base(file)
+		ch, err := strconv.Atoi(strings.TrimPrefix(name[:4], "ch"))
+		if err != nil || !strings.HasPrefix(name, "ch") {
+			t.Fatalf("%s: file name does not start with chNN_", name)
+		}
+		if ch <= last {
+			kept = append(kept, file)
+		}
+	}
+	return kept
 }
 
 // run feeds src to s the way psql -a -q would: every nonempty input line

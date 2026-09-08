@@ -514,3 +514,23 @@ func (e *IsNull) String() string {
 	}
 	return "(" + e.X.String() + " IS NULL)"
 }
+
+// CreateIndex is CREATE [UNIQUE] INDEX name ON table (column). There is
+// no position: PostgreSQL reports CREATE INDEX errors without one.
+type CreateIndex struct {
+	Name   string
+	Table  string
+	Column string
+	Unique bool
+}
+
+// DropIndex is DROP INDEX name.
+type DropIndex struct {
+	Name string
+}
+
+func (*CreateIndex) stmtNode() {}
+func (*DropIndex) stmtNode()   {}
+
+func (s *CreateIndex) String() string { panic("not implemented") }
+func (s *DropIndex) String() string   { panic("not implemented") }
