@@ -307,3 +307,23 @@ func (*Star) String() string         { panic("not implemented") }
 func (e *BinaryExpr) String() string { panic("not implemented") }
 func (e *UnaryExpr) String() string  { panic("not implemented") }
 func (e *IsNull) String() string     { panic("not implemented") }
+
+// CreateIndex is CREATE [UNIQUE] INDEX name ON table (column). There is
+// no position: PostgreSQL reports CREATE INDEX errors without one.
+type CreateIndex struct {
+	Name   string
+	Table  string
+	Column string
+	Unique bool
+}
+
+// DropIndex is DROP INDEX name.
+type DropIndex struct {
+	Name string
+}
+
+func (*CreateIndex) stmtNode() {}
+func (*DropIndex) stmtNode()   {}
+
+func (s *CreateIndex) String() string { panic("not implemented") }
+func (s *DropIndex) String() string   { panic("not implemented") }

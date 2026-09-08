@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/raphi011/build-postgres/internal/btree"
 	"github.com/raphi011/build-postgres/internal/bufmgr"
 	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/smgr"
@@ -93,6 +94,28 @@ func rows(t *testing.T, pool *bufmgr.Pool, oid tuple.OID, desc *tuple.Desc) [][]
 
 func classRow(oid tuple.OID, name string) []tuple.Datum {
 	return []tuple.Datum{int32(oid), name, "r", int32(0), int64(0)}
+}
+
+func indexClassRow(oid tuple.OID, name string) []tuple.Datum {
+	return []tuple.Datum{int32(oid), name, "i", int32(0), int64(0)}
+}
+
+func indexRow(idx *IndexInfo) []tuple.Datum {
+	return []tuple.Datum{int32(idx.OID), int32(idx.Rel), int32(idx.Attr + 1), idx.Unique, idx.Primary}
+}
+
+// catalogClassRows are the pg_class rows Bootstrap writes, in order.
+var catalogClassRows = [][]tuple.Datum{
+	classRow(ClassOID, "pg_class"),
+	classRow(AttributeOID, "pg_attribute"),
+	classRow(IndexOID, "pg_index"),
+}
+
+// catalogAttrRows are the pg_attribute rows Bootstrap writes, in order.
+func catalogAttrRows() [][]tuple.Datum {
+	rows := attrRows(ClassOID, ClassDesc)
+	rows = append(rows, attrRows(AttributeOID, AttributeDesc)...)
+	return append(rows, attrRows(IndexOID, IndexDesc)...)
 }
 
 func attrRows(oid tuple.OID, desc *tuple.Desc) [][]tuple.Datum {
@@ -204,16 +227,14 @@ func TestBootstrapDescribesItself(t *testing.T) {
 	c, _ := bootstrap(t)
 	pool := c.Pool()
 
-	wantClass := [][]tuple.Datum{
-		classRow(ClassOID, "pg_class"),
-		classRow(AttributeOID, "pg_attribute"),
+	if got := rows(t, pool, ClassOID, ClassDesc); !reflect.DeepEqual(got, catalogClassRows) {
+		t.Fatalf("pg_class rows\n got %v\nwant %v", got, catalogClassRows)
 	}
-	if got := rows(t, pool, ClassOID, ClassDesc); !reflect.DeepEqual(got, wantClass) {
-		t.Fatalf("pg_class rows\n got %v\nwant %v", got, wantClass)
+	if got, want := rows(t, pool, AttributeOID, AttributeDesc), catalogAttrRows(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("pg_attribute rows\n got %v\nwant %v", got, want)
 	}
-	wantAttr := append(attrRows(ClassOID, ClassDesc), attrRows(AttributeOID, AttributeDesc)...)
-	if got := rows(t, pool, AttributeOID, AttributeDesc); !reflect.DeepEqual(got, wantAttr) {
-		t.Fatalf("pg_attribute rows\n got %v\nwant %v", got, wantAttr)
+	if got := rows(t, pool, IndexOID, IndexDesc); len(got) != 0 {
+		t.Fatalf("pg_index rows after bootstrap: %v", got)
 	}
 
 	// Rows are stamped with the bootstrap XID.
@@ -230,12 +251,12 @@ func TestBootstrapDescribesItself(t *testing.T) {
 		name string
 		oid  tuple.OID
 		desc *tuple.Desc
-	}{{"pg_class", ClassOID, ClassDesc}, {"pg_attribute", AttributeOID, AttributeDesc}} {
+	}{{"pg_class", ClassOID, ClassDesc}, {"pg_attribute", AttributeOID, AttributeDesc}, {"pg_index", IndexOID, IndexDesc}} {
 		info, err := c.Lookup(tc.name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.OID != tc.oid || info.Name != tc.name || info.Kind != RelKindTable {
+		if info.OID != tc.oid || info.Name != tc.name || info.Kind != RelKindTable || info.Indexes != nil {
 			t.Fatalf("Lookup(%s) = %+v", tc.name, info)
 		}
 		if !reflect.DeepEqual(info.Desc, tc.desc) {
@@ -254,8 +275,8 @@ func TestBootstrapIsDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := rows(t, c2.Pool(), ClassOID, ClassDesc); len(got) != 2 {
-		t.Fatalf("pg_class has %d rows after reopen, want 2", len(got))
+	if got := rows(t, c2.Pool(), ClassOID, ClassDesc); len(got) != 3 {
+		t.Fatalf("pg_class has %d rows after reopen, want 3", len(got))
 	}
 }
 
@@ -314,17 +335,11 @@ func TestCreateTable(t *testing.T) {
 	}
 
 	// Catalog rows in the documented order, stamped with the caller's XID.
-	wantClass := [][]tuple.Datum{
-		classRow(ClassOID, "pg_class"),
-		classRow(AttributeOID, "pg_attribute"),
-		classRow(oid, "users"),
-		classRow(oid2, "orders"),
-	}
+	wantClass := append(catalogClassRows, classRow(oid, "users"), classRow(oid2, "orders"))
 	if got := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(got, wantClass) {
 		t.Fatalf("pg_class rows\n got %v\nwant %v", got, wantClass)
 	}
-	wantAttr := attrRows(ClassOID, ClassDesc)
-	wantAttr = append(wantAttr, attrRows(AttributeOID, AttributeDesc)...)
+	wantAttr := catalogAttrRows()
 	wantAttr = append(wantAttr, attrRows(oid, usersDesc)...)
 	wantAttr = append(wantAttr, attrRows(oid2, ordersDesc)...)
 	if got := rows(t, c.Pool(), AttributeOID, AttributeDesc); !reflect.DeepEqual(got, wantAttr) {
@@ -336,7 +351,7 @@ func TestCreateTable(t *testing.T) {
 	for s.Next() {
 		xmins = append(xmins, s.Tuple().Xmin())
 	}
-	if want := []tuple.XID{1, 1, 10, 11}; !reflect.DeepEqual(xmins, want) {
+	if want := []tuple.XID{1, 1, 1, 10, 11}; !reflect.DeepEqual(xmins, want) {
 		t.Fatalf("pg_class xmins = %v, want %v", xmins, want)
 	}
 }
@@ -398,8 +413,8 @@ func TestCreateTableErrors(t *testing.T) {
 	if after := rows(t, c.Pool(), AttributeOID, AttributeDesc); !reflect.DeepEqual(after, before) {
 		t.Fatal("failed CreateTable wrote pg_attribute rows")
 	}
-	if got := rows(t, c.Pool(), ClassOID, ClassDesc); len(got) != 3 {
-		t.Fatalf("pg_class has %d rows, want 3", len(got))
+	if got := rows(t, c.Pool(), ClassOID, ClassDesc); len(got) != 4 {
+		t.Fatalf("pg_class has %d rows, want 4", len(got))
 	}
 	oid, err := c.NewOID()
 	if err != nil {
@@ -438,7 +453,7 @@ func TestTablesSorted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"apple", "mango", "pg_attribute", "pg_class", "zebra"}
+	want := []string{"apple", "mango", "pg_attribute", "pg_class", "pg_index", "zebra"}
 	if got := names(infos); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Tables = %v, want %v", got, want)
 	}
@@ -468,7 +483,7 @@ func TestPersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names(infos); !reflect.DeepEqual(got, []string{"pg_attribute", "pg_class", "users"}) {
+	if got := names(infos); !reflect.DeepEqual(got, []string{"pg_attribute", "pg_class", "pg_index", "users"}) {
 		t.Fatalf("Tables after reopen = %v", got)
 	}
 }
@@ -524,16 +539,11 @@ func TestDropTable(t *testing.T) {
 	if exists, err := c.Pool().Store().Exists(oid); err != nil || exists {
 		t.Fatalf("relation file after drop: exists=%v err=%v", exists, err)
 	}
-	wantClass := [][]tuple.Datum{
-		classRow(ClassOID, "pg_class"),
-		classRow(AttributeOID, "pg_attribute"),
-		classRow(oid+1, "orders"),
-	}
+	wantClass := append(catalogClassRows, classRow(oid+1, "orders"))
 	if got := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(got, wantClass) {
 		t.Fatalf("pg_class rows after drop\n got %v\nwant %v", got, wantClass)
 	}
-	wantAttr := attrRows(ClassOID, ClassDesc)
-	wantAttr = append(wantAttr, attrRows(AttributeOID, AttributeDesc)...)
+	wantAttr := catalogAttrRows()
 	wantAttr = append(wantAttr, attrRows(oid+1, ordersDesc)...)
 	if got := rows(t, c.Pool(), AttributeOID, AttributeDesc); !reflect.DeepEqual(got, wantAttr) {
 		t.Fatalf("pg_attribute rows after drop\n got %v\nwant %v", got, wantAttr)
@@ -541,7 +551,7 @@ func TestDropTable(t *testing.T) {
 
 	// The deleted rows are still there, stamped with the dropping XID.
 	rel := heap.Open(c.Pool(), ClassOID, ClassDesc)
-	old, err := rel.Fetch(tuple.TID{Block: 0, Off: 3})
+	old, err := rel.Fetch(tuple.TID{Block: 0, Off: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +580,7 @@ func TestDropTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := names(infos); !reflect.DeepEqual(got, []string{"orders", "pg_attribute", "pg_class", "users"}) {
+	if got := names(infos); !reflect.DeepEqual(got, []string{"orders", "pg_attribute", "pg_class", "pg_index", "users"}) {
 		t.Fatalf("Tables after reopen = %v", got)
 	}
 }
@@ -580,7 +590,7 @@ func TestDropTableErrors(t *testing.T) {
 	if err := c.DropTable("nope", 10); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("DropTable(nope) = %v, want ErrNotFound", err)
 	}
-	for _, name := range []string{"pg_class", "pg_attribute"} {
+	for _, name := range []string{"pg_class", "pg_attribute", "pg_index"} {
 		if err := c.DropTable(name, 10); !errors.Is(err, ErrSystemTable) {
 			t.Fatalf("DropTable(%s) = %v, want ErrSystemTable", name, err)
 		}
@@ -744,4 +754,360 @@ func TestLookupConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// Indexes.
+
+// createIndex creates an index and fails the test on error.
+func createIndex(t *testing.T, c *Catalog, name string, rel tuple.OID, attr int, unique, primary bool, xid tuple.XID) *IndexInfo {
+	t.Helper()
+	idx, err := c.CreateIndex(name, rel, attr, unique, primary, xid)
+	if err != nil {
+		t.Fatalf("CreateIndex(%s): %v", name, err)
+	}
+	return idx
+}
+
+func indexNames(idxs []*IndexInfo) []string {
+	var out []string
+	for _, idx := range idxs {
+		out = append(out, idx.Name)
+	}
+	return out
+}
+
+func TestCreateIndex(t *testing.T) {
+	c, dir := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := createIndex(t, c, "users_pkey", oid, 0, true, true, 11)
+	want := &IndexInfo{OID: oid + 1, Name: "users_pkey", Rel: oid, Attr: 0, Unique: true, Primary: true}
+	if !reflect.DeepEqual(idx, want) {
+		t.Fatalf("CreateIndex = %+v, want %+v", idx, want)
+	}
+
+	// Catalog rows: pg_class gets a relkind i row, pg_index the index row,
+	// pg_attribute nothing; all stamped with the caller's XID.
+	wantClass := append(catalogClassRows, classRow(oid, "users"), indexClassRow(idx.OID, "users_pkey"))
+	if got := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(got, wantClass) {
+		t.Fatalf("pg_class rows\n got %v\nwant %v", got, wantClass)
+	}
+	if got, want := rows(t, c.Pool(), IndexOID, IndexDesc), [][]tuple.Datum{indexRow(idx)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pg_index rows\n got %v\nwant %v", got, want)
+	}
+	if got, want := rows(t, c.Pool(), AttributeOID, AttributeDesc), append(catalogAttrRows(), attrRows(oid, usersDesc)...); !reflect.DeepEqual(got, want) {
+		t.Fatalf("pg_attribute rows\n got %v\nwant %v", got, want)
+	}
+	s := heap.Open(c.Pool(), IndexOID, IndexDesc).Scan()
+	defer s.Close()
+	for s.Next() {
+		if s.Tuple().Xmin() != 11 {
+			t.Fatalf("pg_index row xmin = %d, want 11", s.Tuple().Xmin())
+		}
+	}
+
+	// The index file is an empty tree keyed by the column's type.
+	tree := btree.Open(c.Pool(), idx.OID, tuple.Int4)
+	meta, err := tree.Meta()
+	if err != nil || meta.Root != btree.None {
+		t.Fatalf("index file: meta %+v, err %v", meta, err)
+	}
+
+	// The table knows its index; the index is a relation of kind i with
+	// no columns; LookupIndex returns the table's pointer.
+	info, err := c.Lookup("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Indexes) != 1 || !reflect.DeepEqual(info.Indexes[0], want) {
+		t.Fatalf("Lookup(users).Indexes = %+v", info.Indexes)
+	}
+	byName, err := c.LookupIndex("users_pkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if byName != info.Indexes[0] {
+		t.Error("LookupIndex returned a different IndexInfo than Lookup(users).Indexes")
+	}
+	rel, err := c.Lookup("users_pkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rel.OID != idx.OID || rel.Kind != RelKindIndex || rel.Desc.Len() != 0 || rel.Indexes != nil {
+		t.Fatalf("Lookup(users_pkey) = %+v", rel)
+	}
+	if byOID, err := c.LookupOID(idx.OID); err != nil || byOID != rel {
+		t.Fatalf("LookupOID(index) = %+v, %v", byOID, err)
+	}
+
+	// Everything survives a restart.
+	c = reopen(t, c, dir)
+	info, err = c.Lookup("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.Indexes) != 1 || !reflect.DeepEqual(info.Indexes[0], want) {
+		t.Fatalf("after reopen Lookup(users).Indexes = %+v", info.Indexes)
+	}
+	infos, err := c.Tables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(infos); !reflect.DeepEqual(got, []string{"pg_attribute", "pg_class", "pg_index", "users", "users_pkey"}) {
+		t.Fatalf("Tables = %v", got)
+	}
+}
+
+func TestIndexesOrder(t *testing.T) {
+	c, _ := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createIndex(t, c, "users_name", oid, 1, false, false, 10)
+	createIndex(t, c, "users_admin", oid, 2, false, false, 10)
+	createIndex(t, c, "users_pkey", oid, 0, true, true, 10)
+	info, err := c.Lookup("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The primary key first, then by name, whatever the creation order.
+	want := []string{"users_pkey", "users_admin", "users_name"}
+	if got := indexNames(info.Indexes); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Indexes = %v, want %v", got, want)
+	}
+	for _, idx := range info.Indexes {
+		if idx.Rel != oid || idx.Attr < 0 || idx.Attr > 2 {
+			t.Errorf("index %+v", idx)
+		}
+	}
+	// Another table's indexes are not mixed in.
+	oid2, err := c.CreateTable("orders", ordersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createIndex(t, c, "orders_pkey", oid2, 0, true, true, 10)
+	info, _ = c.Lookup("users")
+	if got := indexNames(info.Indexes); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Indexes after another table's index = %v", got)
+	}
+	orders, _ := c.Lookup("orders")
+	if got := indexNames(orders.Indexes); !reflect.DeepEqual(got, []string{"orders_pkey"}) {
+		t.Fatalf("orders Indexes = %v", got)
+	}
+}
+
+func TestCreateIndexErrors(t *testing.T) {
+	c, _ := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := createIndex(t, c, "users_name", oid, 1, false, false, 10)
+	before := rows(t, c.Pool(), ClassOID, ClassDesc)
+
+	cases := []struct {
+		name string
+		idx  string
+		rel  tuple.OID
+		want error
+	}{
+		{"table name", "users", oid, ErrExists},
+		{"index name", "users_name", oid, ErrExists},
+		{"catalog name", "pg_index", oid, ErrExists},
+		{"unknown table", "x", oid + 50, ErrNotFound},
+		{"table is an index", "x", idx.OID, ErrWrongObjectType},
+		{"catalog table", "x", ClassOID, ErrSystemTable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := c.CreateIndex(tc.idx, tc.rel, 0, false, false, 10); !errors.Is(err, tc.want) {
+				t.Fatalf("CreateIndex = %v, want %v", err, tc.want)
+			}
+		})
+	}
+
+	// Nothing was allocated or written by the failed calls.
+	if after := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(after, before) {
+		t.Fatal("failed CreateIndex wrote pg_class rows")
+	}
+	if got := rows(t, c.Pool(), IndexOID, IndexDesc); len(got) != 1 {
+		t.Fatalf("pg_index has %d rows, want 1", len(got))
+	}
+	next, err := c.NewOID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != idx.OID+1 {
+		t.Fatalf("NewOID after failed creates = %d, want %d", next, idx.OID+1)
+	}
+	if _, err := c.LookupIndex("x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LookupIndex(x) = %v, want ErrNotFound", err)
+	}
+	if _, err := c.LookupIndex("users"); !errors.Is(err, ErrWrongObjectType) {
+		t.Fatalf("LookupIndex(users) = %v, want ErrWrongObjectType", err)
+	}
+}
+
+func TestDropIndex(t *testing.T) {
+	c, dir := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkey := createIndex(t, c, "users_pkey", oid, 0, true, true, 10)
+	name := createIndex(t, c, "users_name", oid, 1, false, false, 10)
+
+	if err := c.DropIndex("users_name", 20); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.LookupIndex("users_name"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LookupIndex after drop = %v, want ErrNotFound", err)
+	}
+	if _, err := c.Lookup("users_name"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Lookup after drop = %v, want ErrNotFound", err)
+	}
+	if exists, err := c.Pool().Store().Exists(name.OID); err != nil || exists {
+		t.Fatalf("index file after drop: exists=%v err=%v", exists, err)
+	}
+	info, _ := c.Lookup("users")
+	if got := indexNames(info.Indexes); !reflect.DeepEqual(got, []string{"users_pkey"}) {
+		t.Fatalf("Indexes after drop = %v", got)
+	}
+	wantClass := append(catalogClassRows, classRow(oid, "users"), indexClassRow(pkey.OID, "users_pkey"))
+	if got := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(got, wantClass) {
+		t.Fatalf("pg_class rows after drop\n got %v\nwant %v", got, wantClass)
+	}
+	if got, want := rows(t, c.Pool(), IndexOID, IndexDesc), [][]tuple.Datum{indexRow(pkey)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pg_index rows after drop\n got %v\nwant %v", got, want)
+	}
+	// The deleted rows are still there, stamped with the dropping XID.
+	for _, r := range []struct {
+		oid  tuple.OID
+		desc *tuple.Desc
+		tid  tuple.TID
+	}{{ClassOID, ClassDesc, tuple.TID{Block: 0, Off: 6}}, {IndexOID, IndexDesc, tuple.TID{Block: 0, Off: 2}}} {
+		old, err := heap.Open(c.Pool(), r.oid, r.desc).Fetch(r.tid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if old.Xmax() != 20 {
+			t.Fatalf("dropped row in %d has xmax %d, want 20", r.oid, old.Xmax())
+		}
+	}
+
+	// Errors: unknown, a table, a primary key; nothing changes.
+	if err := c.DropIndex("nope", 10); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("DropIndex(nope) = %v, want ErrNotFound", err)
+	}
+	if err := c.DropIndex("users", 10); !errors.Is(err, ErrWrongObjectType) {
+		t.Fatalf("DropIndex(users) = %v, want ErrWrongObjectType", err)
+	}
+	if err := c.DropIndex("pg_class", 10); !errors.Is(err, ErrWrongObjectType) {
+		t.Fatalf("DropIndex(pg_class) = %v, want ErrWrongObjectType", err)
+	}
+	if err := c.DropIndex("users_pkey", 10); !errors.Is(err, ErrDependentObjects) {
+		t.Fatalf("DropIndex(users_pkey) = %v, want ErrDependentObjects", err)
+	}
+	if _, err := c.Lookup("users"); err != nil {
+		t.Fatalf("users gone after refused drop: %v", err)
+	}
+	if _, err := c.LookupIndex("users_pkey"); err != nil {
+		t.Fatalf("users_pkey gone after refused drop: %v", err)
+	}
+
+	// The name is free again; the drop survives a restart.
+	createIndex(t, c, "users_name", oid, 2, false, false, 30)
+	c = reopen(t, c, dir)
+	info, err = c.Lookup("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := indexNames(info.Indexes); !reflect.DeepEqual(got, []string{"users_pkey", "users_name"}) {
+		t.Fatalf("Indexes after reopen = %v", got)
+	}
+	if info.Indexes[1].Attr != 2 || info.Indexes[1].OID <= name.OID {
+		t.Fatalf("recreated index = %+v", info.Indexes[1])
+	}
+}
+
+func TestDropTableDropsIndexes(t *testing.T) {
+	c, _ := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkey := createIndex(t, c, "users_pkey", oid, 0, true, true, 10)
+	name := createIndex(t, c, "users_name", oid, 1, false, false, 10)
+	oid2, err := c.CreateTable("orders", ordersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := createIndex(t, c, "orders_pkey", oid2, 0, true, true, 10)
+
+	if err := c.DropTable("users_pkey", 10); !errors.Is(err, ErrWrongObjectType) {
+		t.Fatalf("DropTable(index) = %v, want ErrWrongObjectType", err)
+	}
+	if err := c.DropTable("users", 20); err != nil {
+		t.Fatal(err)
+	}
+	for _, idx := range []*IndexInfo{pkey, name} {
+		if _, err := c.LookupIndex(idx.Name); !errors.Is(err, ErrNotFound) {
+			t.Errorf("LookupIndex(%s) after DropTable = %v, want ErrNotFound", idx.Name, err)
+		}
+		if exists, err := c.Pool().Store().Exists(idx.OID); err != nil || exists {
+			t.Errorf("index file %d after DropTable: exists=%v err=%v", idx.OID, exists, err)
+		}
+	}
+	wantClass := append(catalogClassRows, classRow(oid2, "orders"), indexClassRow(other.OID, "orders_pkey"))
+	if got := rows(t, c.Pool(), ClassOID, ClassDesc); !reflect.DeepEqual(got, wantClass) {
+		t.Fatalf("pg_class rows after drop\n got %v\nwant %v", got, wantClass)
+	}
+	if got, want := rows(t, c.Pool(), IndexOID, IndexDesc), [][]tuple.Datum{indexRow(other)}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("pg_index rows after drop\n got %v\nwant %v", got, want)
+	}
+	infos, err := c.Tables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(infos); !reflect.DeepEqual(got, []string{"orders", "orders_pkey", "pg_attribute", "pg_class", "pg_index"}) {
+		t.Fatalf("Tables = %v", got)
+	}
+}
+
+func TestIndexCache(t *testing.T) {
+	c, _ := bootstrap(t)
+	oid, err := c.CreateTable("users", usersDesc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := c.Lookup("users")
+	if len(first.Indexes) != 0 {
+		t.Fatalf("Indexes of a new table = %v", first.Indexes)
+	}
+	createIndex(t, c, "users_pkey", oid, 0, true, true, 10)
+	second, _ := c.Lookup("users")
+	if second == first || len(second.Indexes) != 1 {
+		t.Fatalf("Lookup after CreateIndex: same pointer %v, Indexes %v", second == first, second.Indexes)
+	}
+	idx, err := c.LookupIndex("users_pkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if idx != second.Indexes[0] {
+		t.Error("LookupIndex returned a different pointer than the cached table")
+	}
+	if err := c.DropIndex("users_pkey", 10); err == nil {
+		t.Fatal("dropped a primary key")
+	}
+	createIndex(t, c, "users_name", oid, 1, false, false, 10)
+	if err := c.DropIndex("users_name", 10); err != nil {
+		t.Fatal(err)
+	}
+	third, _ := c.Lookup("users")
+	if got := indexNames(third.Indexes); !reflect.DeepEqual(got, []string{"users_pkey"}) {
+		t.Fatalf("Indexes after DropIndex = %v", got)
+	}
 }

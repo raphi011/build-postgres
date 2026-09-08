@@ -15,18 +15,23 @@ var tInfo = &catalog.RelationInfo{OID: 16384, Name: "t", Kind: catalog.RelKindTa
 	tuple.Attr{Name: "b", Type: tuple.Text},
 )}
 
+var iInfo = &catalog.IndexInfo{OID: 16385, Name: "i", Rel: 16384, Attr: 0}
+
 var (
 	t0   = &query.RangeEntry{Alias: "t", Rel: tInfo}
 	tu   = &query.RangeEntry{Alias: "u", Rel: tInfo}
 	va   = &query.Var{Rel: 0, Attr: 0, Typ: tuple.Int4, Alias: "t", Column: "a"}
 	vb   = &query.Var{Rel: 0, Attr: 1, Typ: tuple.Text, Alias: "t", Column: "b"}
+	ua   = &query.Var{Rel: 0, Attr: 0, Typ: tuple.Int4, Alias: "u", Column: "a"}
 	one  = &query.Const{Typ: tuple.Int4, Value: int32(1)}
+	five = &query.Const{Typ: tuple.Int4, Value: int32(5)}
 	aGt1 = &query.OpExpr{Op: ast.Gt, Typ: tuple.Bool, Left: va, Right: one}
+	aEq1 = &query.OpExpr{Op: ast.Eq, Typ: tuple.Bool, Left: va, Right: one}
 )
 
 func TestRange(t *testing.T) {
 	scan := &SeqScan{Rel: t0}
-	for _, n := range []Node{scan, &Filter{Input: scan}, &Sort{Input: scan}, &Limit{Input: scan}} {
+	for _, n := range []Node{scan, &Filter{Input: scan}, &Sort{Input: scan}, &Limit{Input: scan}, &IndexScan{Rel: t0, Index: iInfo}} {
 		if r := n.Range(); len(r) != 1 || r[0] != t0 {
 			t.Errorf("%T.Range() = %v, want [t]", n, r)
 		}
@@ -83,6 +88,21 @@ Update on t
 		{"delete", &ModifyTable{Op: Delete, Rel: t0, Input: &SeqScan{Rel: t0}}, `
 Delete on t
   ->  Seq Scan on t`},
+		{"index scan", &IndexScan{Rel: t0, Index: iInfo, Quals: []query.Expr{aEq1}}, `
+Index Scan using i on t
+  Index Cond: (t.a = 1)`},
+		{"index scan, alias and two conds", &IndexScan{Rel: tu, Index: iInfo, Quals: []query.Expr{
+			&query.OpExpr{Op: ast.Gt, Typ: tuple.Bool, Left: ua, Right: one},
+			&query.OpExpr{Op: ast.Le, Typ: tuple.Bool, Left: ua, Right: five},
+		}}, `
+Index Scan using i on t u
+  Index Cond: ((u.a > 1) AND (u.a <= 5))`},
+		{"index scan without cond", &IndexScan{Rel: t0, Index: iInfo}, "Index Scan using i on t"},
+		{"index scan with filter", &Filter{Input: &IndexScan{Rel: t0, Index: iInfo, Quals: []query.Expr{aGt1}},
+			Qual: &query.NullTest{X: vb}}, `
+Index Scan using i on t
+  Index Cond: (t.a > 1)
+  Filter: (t.b IS NULL)`},
 	}
 	for _, c := range cases {
 		got := strings.Join(Explain(c.plan), "\n")

@@ -1,0 +1,107 @@
+-- Index DDL: CREATE INDEX, PRIMARY KEY, DROP INDEX, and the catalogs.
+CREATE TABLE t (a int4 PRIMARY KEY, b text, c int8);
+CREATE INDEX t_b ON t (b);
+CREATE UNIQUE INDEX t_c_key ON t (c);
+SELECT oid, relname, relkind FROM pg_class WHERE oid >= 16384 ORDER BY oid;
+  oid  | relname | relkind 
+-------+---------+---------
+ 16384 | t       | r
+ 16385 | t_pkey  | i
+ 16386 | t_b     | i
+ 16387 | t_c_key | i
+(4 rows)
+
+SELECT indexrelid, indrelid, indkey, indisunique, indisprimary
+  FROM pg_index ORDER BY indexrelid;
+ indexrelid | indrelid | indkey | indisunique | indisprimary 
+------------+----------+--------+-------------+--------------
+      16385 |    16384 |      1 | t           | t
+      16386 |    16384 |      2 | f           | f
+      16387 |    16384 |      3 | t           | f
+(3 rows)
+
+-- Errors.
+CREATE INDEX t_b ON t (b);
+ERROR:  relation "t_b" already exists
+CREATE INDEX t ON t (b);
+ERROR:  relation "t" already exists
+CREATE INDEX x ON nope (a);
+ERROR:  relation "nope" does not exist
+CREATE INDEX x ON t (nope);
+ERROR:  column "nope" does not exist
+CREATE INDEX x ON t_b (a);
+ERROR:  "t_b" is an index
+CREATE INDEX x ON pg_class (oid);
+ERROR:  permission denied: "pg_class" is a system catalog
+DROP INDEX nope;
+ERROR:  index "nope" does not exist
+DROP INDEX t;
+ERROR:  "t" is not an index
+DROP TABLE t_b;
+ERROR:  "t_b" is not a table
+DROP INDEX t_pkey;
+ERROR:  cannot drop index t_pkey because constraint t_pkey on table t requires it
+SELECT * FROM t_b;
+ERROR:  "t_b" is an index
+LINE 1: SELECT * FROM t_b;
+                      ^
+INSERT INTO t_b VALUES (1);
+ERROR:  "t_b" is an index
+LINE 1: INSERT INTO t_b VALUES (1);
+                    ^
+UPDATE t_b SET a = 1;
+ERROR:  "t_b" is an index
+LINE 1: UPDATE t_b SET a = 1;
+               ^
+DELETE FROM t_b;
+ERROR:  "t_b" is an index
+LINE 1: DELETE FROM t_b;
+                    ^
+-- A taken _pkey name fails the whole CREATE TABLE.
+CREATE INDEX p_pkey ON t (c);
+CREATE TABLE p (a int4 PRIMARY KEY);
+ERROR:  relation "p_pkey" already exists
+SELECT * FROM p;
+ERROR:  relation "p" does not exist
+LINE 1: SELECT * FROM p;
+                      ^
+DROP INDEX p_pkey;
+CREATE TABLE p (a int4 PRIMARY KEY);
+-- Drop and recreate over data.
+INSERT INTO t VALUES (1, 'x', 10), (2, 'y', 20), (3, NULL, NULL);
+DROP INDEX t_b;
+CREATE INDEX t_b ON t (b);
+SELECT oid, relname, relkind FROM pg_class WHERE oid >= 16384 ORDER BY oid;
+  oid  | relname | relkind 
+-------+---------+---------
+ 16384 | t       | r
+ 16385 | t_pkey  | i
+ 16387 | t_c_key | i
+ 16390 | p       | r
+ 16391 | p_pkey  | i
+ 16392 | t_b     | i
+(6 rows)
+
+SELECT * FROM t ORDER BY a;
+ a | b | c  
+---+---+----
+ 1 | x | 10
+ 2 | y | 20
+ 3 |   |   
+(3 rows)
+
+-- DROP TABLE drops the table's indexes.
+DROP TABLE t;
+SELECT oid, relname, relkind FROM pg_class WHERE oid >= 16384 ORDER BY oid;
+  oid  | relname | relkind 
+-------+---------+---------
+ 16390 | p       | r
+ 16391 | p_pkey  | i
+(2 rows)
+
+SELECT indexrelid, indrelid FROM pg_index ORDER BY indexrelid;
+ indexrelid | indrelid 
+------------+----------
+      16391 |    16390
+(1 row)
+

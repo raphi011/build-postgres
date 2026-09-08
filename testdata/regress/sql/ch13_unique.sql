@@ -1,0 +1,32 @@
+-- Unique indexes and primary keys reject duplicate keys.
+CREATE TABLE t (a int4 PRIMARY KEY, b text);
+CREATE UNIQUE INDEX t_b_key ON t (b);
+INSERT INTO t VALUES (1, 'x');
+INSERT INTO t VALUES (1, 'y');
+INSERT INTO t VALUES (2, 'x');
+INSERT INTO t VALUES (2, 'y');
+SELECT * FROM t ORDER BY a;
+-- UPDATE to a taken key fails; to the row's own key it succeeds.
+UPDATE t SET a = 2 WHERE a = 1;
+UPDATE t SET b = 'y' WHERE a = 1;
+UPDATE t SET a = 1, b = 'x' WHERE a = 1;
+UPDATE t SET b = 'z' WHERE a = 2;
+SELECT * FROM t ORDER BY a;
+-- A deleted key can be used again.
+DELETE FROM t WHERE a = 1;
+INSERT INTO t VALUES (1, 'x');
+-- NULLs never conflict.
+INSERT INTO t VALUES (3, NULL), (4, NULL);
+UPDATE t SET b = NULL WHERE a = 1;
+SELECT * FROM t ORDER BY a;
+-- A unique index cannot be built over duplicates, and nothing is left of
+-- the failed attempt.
+CREATE TABLE u (a int4, b text);
+INSERT INTO u VALUES (1, 'x'), (1, 'y'), (2, NULL), (3, NULL);
+CREATE UNIQUE INDEX u_a_key ON u (a);
+SELECT relname FROM pg_class WHERE relname = 'u_a_key';
+CREATE UNIQUE INDEX u_b_key ON u (b);
+CREATE INDEX u_a ON u (a);
+INSERT INTO u VALUES (4, 'x');
+INSERT INTO u VALUES (4, NULL);
+SELECT * FROM u ORDER BY a, b;

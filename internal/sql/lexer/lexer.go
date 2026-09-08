@@ -84,11 +84,11 @@ var keywords = map[string]bool{
 	"and": true, "as": true, "asc": true, "begin": true, "by": true,
 	"commit": true, "create": true, "delete": true, "desc": true,
 	"drop": true, "explain": true, "false": true, "from": true,
-	"insert": true, "into": true, "is": true, "join": true, "key": true,
-	"limit": true, "not": true, "null": true, "on": true, "or": true,
-	"order": true, "primary": true, "rollback": true, "select": true,
-	"set": true, "table": true, "true": true, "update": true,
-	"values": true, "where": true,
+	"index": true, "insert": true, "into": true, "is": true, "join": true,
+	"key": true, "limit": true, "not": true, "null": true, "on": true,
+	"or": true, "order": true, "primary": true, "rollback": true,
+	"select": true, "set": true, "table": true, "true": true,
+	"unique": true, "update": true, "values": true, "where": true,
 }
 
 var (

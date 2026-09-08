@@ -6,8 +6,9 @@ directory, and a control file that hands out OIDs that never repeat.
 
 **You edit.** `internal/catalog/control.go`: 2 functions with
 `panic("not implemented")` bodies, `ReadControl` and `WriteControl`.
-`internal/catalog/catalog.go`: 8 functions, `Bootstrap` through `Tables`.
-Nothing else changes; `catalog_test.go` is the contract.
+`internal/catalog/catalog.go`: 8 functions, `Bootstrap` through `Tables`;
+the three index functions after them are chapter 13's. Nothing else
+changes; `catalog_test.go` is the contract.
 
 **Needs from earlier chapters.** `internal/tuple` (`Desc`, `Form`,
 `Deform`, `BootstrapXID`, `FirstNormalXID`), `internal/heap` (`Create`,
@@ -120,9 +121,11 @@ type is unsigned; the difference does not matter at any scale this book
 reaches. There is no `pg_type` (D5), so `atttypid` holds the enum value
 directly.
 
-Bootstrap writes rows in this order: the `pg_class` row for `pg_class`,
-then for `pg_attribute`, then the five `pg_attribute` rows of `pg_class`,
-then the five of `pg_attribute`. All are stamped with `tuple.BootstrapXID`.
+Bootstrap writes rows in this order: the `pg_class` rows for `pg_class`,
+`pg_attribute`, and `pg_index` (a third catalog that chapter 13 fills;
+its descriptor `IndexDesc` is given, and the tests expect its rows from
+the start), then the five `pg_attribute` rows of each, in the same
+order. All are stamped with `tuple.BootstrapXID`.
 A user table's rows are the `pg_class` row followed by one `pg_attribute`
 row per column in column order, stamped with the XID the caller passes.
 Because chapter 05's scan returns tuples in insertion order, the tests can
@@ -631,7 +634,8 @@ PostgreSQL's design where the design is the lesson (D4).
 ## Out of scope
 
 `pg_type`, `pg_namespace` and schemas, `pg_database`, `pg_index` (chapter
-13), `relpages`/`reltuples` maintenance (chapter 14), OID prefetch and
+13, which also adds its bootstrap rows to the tests of this chapter),
+`relpages`/`reltuples` maintenance (chapter 14), OID prefetch and
 wraparound, system columns (`ctid`, `xmin` as selectable columns),
 `ALTER TABLE`, temporary tables, and any transactional behaviour of DDL:
 a `CreateTable` whose caller later rolls back stays created until chapter

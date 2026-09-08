@@ -3,6 +3,7 @@
 package plan
 
 import (
+	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/sql/query"
 )
 
@@ -103,3 +104,19 @@ func (*ModifyTable) node() {}
 func Explain(n Node) []string {
 	panic("not implemented")
 }
+
+// IndexScan reads the tuples of Rel whose key in Index satisfies Quals,
+// in index order, fetching each from the heap. Every qual is an OpExpr
+// with the indexed column as its left operand, an expression without
+// Vars on the right, and one of = < <= > >= as operator; several quals
+// on the same side tighten each other. No quals reads the whole index.
+// EXPLAIN prints "Index Scan using i on t" and the quals ANDed together
+// as "Index Cond:".
+type IndexScan struct {
+	Rel   *query.RangeEntry
+	Index *catalog.IndexInfo
+	Quals []query.Expr
+}
+
+func (n *IndexScan) Range() []*query.RangeEntry { return []*query.RangeEntry{n.Rel} }
+func (*IndexScan) node()                        {}

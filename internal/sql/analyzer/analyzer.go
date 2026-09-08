@@ -33,6 +33,7 @@ var (
 	ErrNotNull           = errors.New("not-null violation")       // 23502
 	ErrSyntax            = errors.New("syntax error")             // 42601
 	ErrTableDefinition   = errors.New("invalid table definition") // 42P16
+	ErrWrongObjectType   = errors.New("wrong object type")        // 42809
 )
 
 // Error is an analysis error. Msg is PostgreSQL's message text. Pos is

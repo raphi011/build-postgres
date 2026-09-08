@@ -11,6 +11,7 @@ import (
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
+	"github.com/raphi011/build-postgres/internal/index"
 	"github.com/raphi011/build-postgres/internal/planner"
 	"github.com/raphi011/build-postgres/internal/sql/analyzer"
 	"github.com/raphi011/build-postgres/internal/sql/lexer"
@@ -155,6 +156,10 @@ func TestErrors(t *testing.T) {
 	s := newSession(t)
 	exec(t, s, "create table t (a int4 not null, b int4, c text)")
 	exec(t, s, "insert into t values (1, null, 'x')")
+	exec(t, s, "create unique index t_a_key on t (a)")
+	exec(t, s, "create index i on t (b)")
+	exec(t, s, "create index t_c on t (c)")
+	exec(t, s, "create table p (a int4 primary key)")
 	cases := []struct {
 		sql  string
 		msg  string
@@ -181,6 +186,21 @@ func TestErrors(t *testing.T) {
 		{"select * from t limit -1", `LIMIT must not be negative`, 0, 0, executor.ErrInvalidRowCount},
 		{"update t set a = b", `null value in column "a" of relation "t" violates not-null constraint`, 0, 0, executor.ErrNotNull},
 		{"select * from t, t as u", `joins are not supported until chapter 15`, 0, 0, planner.ErrJoin},
+		{"create index j on nope (a)", `relation "nope" does not exist`, 0, 0, analyzer.ErrUndefinedTable},
+		{"create index j on t (nope)", `column "nope" does not exist`, 0, 0, analyzer.ErrUndefinedColumn},
+		{"create index j on i (a)", `"i" is an index`, 0, 0, analyzer.ErrWrongObjectType},
+		{"create index t_a_key on t (b)", `relation "t_a_key" already exists`, 0, 0, catalog.ErrExists},
+		{"create index t on t (b)", `relation "t" already exists`, 0, 0, catalog.ErrExists},
+		{"create index j on pg_class (oid)", `permission denied: "pg_class" is a system catalog`, 0, 0, catalog.ErrSystemTable},
+		{"create table q (a int4 primary key, b int4 primary key)", `multiple primary keys for table "q" are not allowed`, 0, 0, analyzer.ErrTableDefinition},
+		{"drop index nope", `index "nope" does not exist`, 0, 0, catalog.ErrNotFound},
+		{"drop index t", `"t" is not an index`, 0, 0, catalog.ErrWrongObjectType},
+		{"drop table i", `"i" is not a table`, 0, 0, catalog.ErrWrongObjectType},
+		{"drop index p_pkey", `cannot drop index p_pkey because constraint p_pkey on table p requires it`, 0, 0, catalog.ErrDependentObjects},
+		{"select * from i", `"i" is an index`, 1, 15, analyzer.ErrWrongObjectType},
+		{"insert into i values (1)", `"i" is an index`, 1, 13, analyzer.ErrWrongObjectType},
+		{"insert into t values (1, 2, 'y')", `duplicate key value violates unique constraint "t_a_key"`, 0, 0, index.ErrUniqueViolation},
+		{"insert into t values (2, 2, '" + strings.Repeat("y", 2700) + "')", `index row size 2712 exceeds btree version 4 maximum 2704 for index "t_c"`, 0, 0, index.ErrTooLarge},
 	}
 	for _, c := range cases {
 		_, err := s.Exec(c.sql)
@@ -329,6 +349,25 @@ func TestResultString(t *testing.T) {
 				` a      | integer | not null`,
 				` b      | text    | `,
 				``)},
+		{"footer after the rows", Result{Title: `Table "t"`, NoCount: true,
+			Columns: []Column{{"Column", tuple.Text}, {"Type", tuple.Text}},
+			Rows:    [][]tuple.Datum{{"a", "integer"}},
+			Footer:  []string{"Indexes:", `    "t_pkey" PRIMARY KEY, btree (a)`}},
+			lines(`    Table "t"`,
+				` Column |  Type   `,
+				`--------+---------`,
+				` a      | integer`,
+				`Indexes:`,
+				`    "t_pkey" PRIMARY KEY, btree (a)`,
+				``)},
+		{"footer after the count", Result{Columns: []Column{{"a", tuple.Int4}}, Rows: [][]tuple.Datum{{int32(1)}},
+			Footer: []string{"note"}},
+			lines(` a `,
+				`---`,
+				` 1`,
+				`(1 row)`,
+				`note`,
+				``)},
 	}
 	for _, c := range cases {
 		if got := c.res.String(); got != c.want {
@@ -396,12 +435,47 @@ func TestDescribe(t *testing.T) {
 		` b      | text    | `,
 		` c      | boolean | not null`,
 		` d      | bigint  | `,
+		`Indexes:`,
+		`    "t_pkey" PRIMARY KEY, btree (a)`,
 		``)
 	if got := r.String(); got != want {
 		t.Errorf("\\d t =\n%s\nwant\n%s", got, want)
 	}
+	// More indexes: the primary key first, then by name; unique ones say so.
+	exec(t, s, "create unique index u on t (d)")
+	exec(t, s, "create index i on t (b)")
+	r, _ = s.Describe("t")
+	if got, want := strings.Join(r.Footer, "\n"), "Indexes:\n    \"t_pkey\" PRIMARY KEY, btree (a)\n    \"i\" btree (b)\n    \"u\" UNIQUE, btree (d)"; got != want {
+		t.Errorf("\\d t footer =\n%s\nwant\n%s", got, want)
+	}
+	r, _ = s.Describe("Mixed")
+	if r.Footer != nil {
+		t.Errorf("\\d of a table without indexes has footer %q", r.Footer)
+	}
+	// \d of an index.
+	r, err = s.Describe("t_pkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = lines(`            Index "t_pkey"`,
+		` Column |  Type   | Key? | Definition `,
+		`--------+---------+------+------------`,
+		` a      | integer | yes  | a`,
+		`primary key, btree, for table "t"`,
+		``)
+	if got := r.String(); got != want {
+		t.Errorf("\\d t_pkey =\n%s\nwant\n%s", got, want)
+	}
+	r, _ = s.Describe("u")
+	if got := r.String(); !strings.HasSuffix(got, "unique, btree, for table \"t\"\n\n") || !strings.Contains(got, ` d      | bigint | yes  | d`) {
+		t.Errorf("\\d u =\n%s", got)
+	}
+	r, _ = s.Describe("i")
+	if got := r.String(); !strings.HasSuffix(got, "btree, for table \"t\"\n\n") || strings.Contains(got, "unique") {
+		t.Errorf("\\d i =\n%s", got)
+	}
 	r, err = s.Describe("pg_class")
-	if err != nil || len(r.Rows) != 5 || r.Title != `Table "pg_class"` {
+	if err != nil || len(r.Rows) != 5 || r.Title != `Table "pg_class"` || r.Footer != nil {
 		t.Errorf("\\d pg_class: %+v, %v", r, err)
 	}
 	_, err = s.Describe("nope")
@@ -414,6 +488,7 @@ func TestDescribe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Indexes are not listed.
 	want = lines(`List of relations`,
 		` Name  | Type  `,
 		`-------+-------`,
@@ -423,6 +498,110 @@ func TestDescribe(t *testing.T) {
 		``)
 	if got := r.String(); got != want {
 		t.Errorf("\\dt =\n%s\nwant\n%s", got, want)
+	}
+}
+
+func TestIndexes(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "data")
+	s := open(t, dir)
+	exec(t, s, "create table t (a int4, b text)")
+	exec(t, s, "insert into t values (1, 'x'), (1, 'y'), (2, null), (3, null)")
+
+	// A unique index cannot be built over duplicates, and a failed build
+	// leaves no index behind.
+	_, err := s.Exec("create unique index t_a_key on t (a)")
+	var e *Error
+	if !errors.As(err, &e) || !errors.Is(err, index.ErrUniqueViolation) || e.Msg != `could not create unique index "t_a_key"` {
+		t.Fatalf("unique index over duplicates: %#v", err)
+	}
+	if r := exec(t, s, "select relname from pg_class where relname = 't_a_key'"); len(r.Rows) != 0 {
+		t.Errorf("failed index left a pg_class row: %v", r.Rows)
+	}
+	if r, _ := s.Describe("t"); r.Footer != nil {
+		t.Errorf("failed index left a footer: %q", r.Footer)
+	}
+	// NULLs are no duplicates, so a unique index on b builds.
+	if r := exec(t, s, "create unique index t_b_key on t (b)"); r.Tag != "CREATE INDEX" || r.Columns != nil {
+		t.Errorf("create index: %+v", r)
+	}
+	if r := exec(t, s, "create index t_a on t (a)"); r.Tag != "CREATE INDEX" {
+		t.Errorf("create index tag %q", r.Tag)
+	}
+
+	// The catalogs describe the indexes.
+	r := exec(t, s, "select oid, relname, relkind from pg_class where oid >= 16384 order by oid")
+	wantRows := [][]tuple.Datum{{int32(16384), "t", "r"}, {int32(16386), "t_b_key", "i"}, {int32(16387), "t_a", "i"}}
+	if !reflect.DeepEqual(r.Rows, wantRows) {
+		t.Errorf("pg_class rows %v, want %v", r.Rows, wantRows)
+	}
+	r = exec(t, s, "select indexrelid, indrelid, indkey, indisunique, indisprimary from pg_index order by indexrelid")
+	wantRows = [][]tuple.Datum{{int32(16386), int32(16384), int32(2), true, false}, {int32(16387), int32(16384), int32(1), false, false}}
+	if !reflect.DeepEqual(r.Rows, wantRows) {
+		t.Errorf("pg_index rows %v, want %v", r.Rows, wantRows)
+	}
+
+	// The unique index is enforced from now on.
+	if _, err := s.Exec("insert into t values (4, 'x')"); !errors.Is(err, index.ErrUniqueViolation) {
+		t.Errorf("duplicate insert: %v", err)
+	}
+	if r := exec(t, s, "insert into t values (4, null), (5, 'z')"); r.Tag != "INSERT 0 2" {
+		t.Errorf("insert tag %q", r.Tag)
+	}
+	if _, err := s.Exec("update t set b = 'z' where a = 1"); !errors.Is(err, index.ErrUniqueViolation) {
+		t.Errorf("update to a taken key: %v", err)
+	}
+	if r := exec(t, s, "update t set b = 'z' where a = 5"); r.Tag != "UPDATE 1" {
+		t.Errorf("update to own key: %q", r.Tag)
+	}
+	exec(t, s, "delete from t where a = 5")
+	if r := exec(t, s, "insert into t values (6, 'z')"); r.Tag != "INSERT 0 1" {
+		t.Errorf("reinsert of a deleted key: %q", r.Tag)
+	}
+	if r := exec(t, s, "drop index t_b_key"); r.Tag != "DROP INDEX" || r.Columns != nil {
+		t.Errorf("drop index: %+v", r)
+	}
+	exec(t, s, "insert into t values (7, 'z')")
+
+	// PRIMARY KEY makes <table>_pkey; a taken name fails the whole CREATE
+	// TABLE, as PostgreSQL rolls it back.
+	exec(t, s, "create index p_pkey on t (a)")
+	_, err = s.Exec("create table p (a int4 primary key)")
+	if !errors.As(err, &e) || !errors.Is(err, catalog.ErrExists) || e.Msg != `relation "p_pkey" already exists` {
+		t.Fatalf("create table with a taken pkey name: %#v", err)
+	}
+	if _, err := s.Exec("select * from p"); !errors.Is(err, analyzer.ErrUndefinedTable) {
+		t.Errorf("table p exists after the failed create: %v", err)
+	}
+	exec(t, s, "drop index p_pkey")
+	exec(t, s, "create table p (a int4 primary key, b text)")
+	exec(t, s, "insert into p values (1, 'x')")
+	if _, err := s.Exec("insert into p values (1, 'y')"); !errors.As(err, &e) || e.Msg != `duplicate key value violates unique constraint "p_pkey"` {
+		t.Errorf("duplicate primary key: %#v", err)
+	}
+	if _, err := s.Exec("insert into p values (null, 'y')"); !errors.Is(err, analyzer.ErrNotNull) {
+		t.Errorf("NULL primary key: %v", err)
+	}
+
+	// Everything survives a restart, and DROP TABLE takes the indexes.
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open(t, dir)
+	if _, err := s.Exec("insert into p values (1, 'z')"); !errors.Is(err, index.ErrUniqueViolation) {
+		t.Errorf("duplicate after reopen: %v", err)
+	}
+	r, _ = s.Describe("t")
+	if got := strings.Join(r.Footer, "\n"); got != "Indexes:\n    \"t_a\" btree (a)" {
+		t.Errorf("\\d t after reopen: %q", got)
+	}
+	exec(t, s, "drop table t")
+	exec(t, s, "drop table p")
+	r = exec(t, s, "select relname from pg_class where oid >= 16384")
+	if len(r.Rows) != 0 {
+		t.Errorf("relations left after drops: %v", r.Rows)
+	}
+	if r := exec(t, s, "select indexrelid from pg_index"); len(r.Rows) != 0 {
+		t.Errorf("pg_index rows left after drops: %v", r.Rows)
 	}
 }
 

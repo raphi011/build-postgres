@@ -164,6 +164,8 @@ func TestPlanErrors(t *testing.T) {
 		{"select 1 from t join t as u on t.a = u.a", ErrJoin},
 		{"create table x (a int4)", ErrUtility},
 		{"drop table t", ErrUtility},
+		{"create index i on t (a)", ErrUtility},
+		{"drop index i", ErrUtility},
 		{"begin", ErrUtility},
 		{"commit", ErrUtility},
 		{"rollback", ErrUtility},

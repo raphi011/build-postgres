@@ -75,10 +75,12 @@ type Result struct {
 	NoCount bool   // omit the (n rows) line, as \d does
 	Columns []Column
 	Rows    [][]tuple.Datum
+	Footer  []string // lines printed after the rows, as \d prints Indexes:
 }
 
 // String renders a result set in psql's aligned format, ending with the
-// row count line and a blank line. It is empty when Columns is nil.
+// row count line, the Footer lines, and a blank line. It is empty when
+// Columns is nil.
 // PostgreSQL: print_aligned_text in print.c.
 func (r *Result) String() string {
 	panic("not implemented")
