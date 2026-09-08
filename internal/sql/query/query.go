@@ -329,7 +329,11 @@ func (*Commit) String() string      { return "Commit" }
 func (*Rollback) String() string    { return "Rollback" }
 
 func (s *Explain) String() string {
-	return "Explain\n  " + strings.ReplaceAll(s.Stmt.String(), "\n", "\n  ")
+	head := "Explain"
+	if s.CostsOff {
+		head += " (COSTS OFF)"
+	}
+	return head + "\n  " + strings.ReplaceAll(s.Stmt.String(), "\n", "\n  ")
 }
 
 // Expressions print as SQL with every operator application in
@@ -421,4 +425,9 @@ type Analyze struct {
 func (*Analyze) stmtNode() {}
 
 // Analyze dumps as "Analyze t (16384)", or "Analyze" for the database.
-func (s *Analyze) String() string { panic("not implemented") }
+func (s *Analyze) String() string {
+	if s.Rel == nil {
+		return "Analyze"
+	}
+	return fmt.Sprintf("Analyze %s (%d)", ast.QuoteIdent(s.Rel.Name), s.Rel.OID)
+}

@@ -3,6 +3,7 @@
 package plan
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/raphi011/build-postgres/internal/catalog"
@@ -35,7 +36,7 @@ type Estimate struct {
 // String renders e as EXPLAIN prints it: "cost=0.00..1.04 rows=1
 // width=36", the costs with two decimals and the rows without.
 func (e Estimate) String() string {
-	panic("not implemented")
+	return fmt.Sprintf("cost=%.2f..%.2f rows=%.0f width=%d", e.StartupCost, e.TotalCost, e.Rows, e.Width)
 }
 
 // Result yields one empty row. It is the input of a SELECT without FROM.
@@ -152,15 +153,18 @@ func (*ModifyTable) node() {}
 // PostgreSQL: ExplainNode in explain.c.
 func Explain(n Node) []string {
 	var lines []string
-	explain(n, 0, &lines)
+	explain(n, 0, &lines, false)
 	return lines
 }
 
 // explain appends the lines for n at the given nesting level. A node's
 // headline is prefixed with "->  " below the root; its properties are
 // indented two past the headline text.
-func explain(n Node, level int, lines *[]string) {
+func explain(n Node, level int, lines *[]string, costs bool) {
 	head, props, children := describe(n)
+	if costs {
+		head += "  (" + n.Estimate().String() + ")"
+	}
 	indent := 0
 	if level > 0 {
 		indent = 2 + 6*(level-1)
@@ -172,7 +176,7 @@ func explain(n Node, level int, lines *[]string) {
 		*lines = append(*lines, propIndent+p)
 	}
 	for _, c := range children {
-		explain(c, level+1, lines)
+		explain(c, level+1, lines, costs)
 	}
 }
 
@@ -254,5 +258,7 @@ func (*IndexScan) node()                        {}
 // for a scan is that of the outermost node wrapping it.
 // PostgreSQL: ExplainNode in explain.c.
 func ExplainCosts(n Node) []string {
-	panic("not implemented")
+	var lines []string
+	explain(n, 0, &lines, true)
+	return lines
 }

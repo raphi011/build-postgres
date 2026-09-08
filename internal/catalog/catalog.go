@@ -740,10 +740,10 @@ func (c *Catalog) loadIndexes(info *RelationInfo) error {
 		info.Indexes = nil
 		return nil
 	}
-	names := map[tuple.OID]string{}
+	classes := map[tuple.OID]*RelationInfo{}
 	err = c.scanClass(func(_ tuple.TID, r *RelationInfo) (bool, error) {
 		if r.Kind == RelKindIndex {
-			names[r.OID] = r.Name
+			classes[r.OID] = r
 		}
 		return true, nil
 	})
@@ -752,11 +752,12 @@ func (c *Catalog) loadIndexes(info *RelationInfo) error {
 	}
 	var idxs []*IndexInfo
 	for _, r := range rows {
-		name, ok := names[r.oid]
+		class, ok := classes[r.oid]
 		if !ok {
 			return fmt.Errorf("catalog: index %d has no pg_class row", r.oid)
 		}
-		idxs = append(idxs, &IndexInfo{OID: r.oid, Name: name, Rel: r.rel, Attr: r.attr, Unique: r.unique, Primary: r.primary})
+		idxs = append(idxs, &IndexInfo{OID: r.oid, Name: class.Name, Rel: r.rel, Attr: r.attr,
+			Unique: r.unique, Primary: r.primary, Pages: class.Pages, Tuples: class.Tuples})
 	}
 	sort.Slice(idxs, func(i, j int) bool {
 		if idxs[i].Primary != idxs[j].Primary {
@@ -773,5 +774,22 @@ func (c *Catalog) loadIndexes(info *RelationInfo) error {
 // xid. Returns ErrNotFound for an unknown OID. Does not flush.
 // PostgreSQL: vac_update_relstats in vacuum.c.
 func (c *Catalog) UpdateStats(oid tuple.OID, pages int32, tuples int64, xid tuple.XID) error {
-	panic("not implemented")
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	tid, info, err := c.findClassTID(func(r *RelationInfo) bool { return r.OID == oid })
+	if err != nil {
+		return err
+	}
+	t, err := tuple.Form(ClassDesc, []tuple.Datum{
+		int32(info.OID), info.Name, string(info.Kind), pages, tuples,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	if _, err := c.class.Update(tid, t, xid); err != nil {
+		return err
+	}
+	c.invalidate()
+	return nil
 }

@@ -226,8 +226,26 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 		return &ast.Rollback{}, p.advance()
 	case "explain":
 		return p.parseExplain()
+	case "analyze":
+		return p.parseAnalyze()
 	}
 	return nil, p.syntaxError("statement")
+}
+
+// parseAnalyze parses ANALYZE [table].
+func (p *parser) parseAnalyze() (ast.Stmt, error) {
+	if err := p.expect("analyze"); err != nil {
+		return nil, err
+	}
+	s := &ast.Analyze{}
+	if p.tok.Kind == lexer.Ident {
+		name, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		s.Table = name
+	}
+	return s, nil
 }
 
 // parseCreate dispatches CREATE TABLE and CREATE [UNIQUE] INDEX.
@@ -675,9 +693,37 @@ func (p *parser) parseDelete() (ast.Stmt, error) {
 	return s, err
 }
 
+// parseExplain parses EXPLAIN [(COSTS [ON | OFF])] stmt. The option
+// words are identifiers, not keywords, like type names (D19).
 func (p *parser) parseExplain() (ast.Stmt, error) {
 	if err := p.expect("explain"); err != nil {
 		return nil, err
+	}
+	costsOff := false
+	if p.tok.Kind == lexer.LParen {
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if p.tok.Kind != lexer.Ident || p.tok.Text != "costs" {
+			return nil, p.syntaxError("COSTS")
+		}
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		switch {
+		case p.tok.Kind == lexer.Ident && p.tok.Text == "off":
+			costsOff = true
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+		case p.isKeyword("on"):
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+		}
+		if _, err := p.expectKind(lexer.RParen); err != nil {
+			return nil, err
+		}
 	}
 	if !p.isKeyword("select") && !p.isKeyword("insert") && !p.isKeyword("update") && !p.isKeyword("delete") {
 		return nil, p.syntaxError("SELECT, INSERT, UPDATE, or DELETE")
@@ -686,7 +732,7 @@ func (p *parser) parseExplain() (ast.Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ast.Explain{Stmt: s}, nil
+	return &ast.Explain{Stmt: s, CostsOff: costsOff}, nil
 }
 
 // Binding powers, lowest first. PostgreSQL's table from gram.y:

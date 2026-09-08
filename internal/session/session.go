@@ -14,6 +14,7 @@ import (
 	"github.com/raphi011/build-postgres/internal/catalog"
 	"github.com/raphi011/build-postgres/internal/executor"
 	"github.com/raphi011/build-postgres/internal/executor/expr"
+	"github.com/raphi011/build-postgres/internal/heap"
 	"github.com/raphi011/build-postgres/internal/index"
 	"github.com/raphi011/build-postgres/internal/plan"
 	"github.com/raphi011/build-postgres/internal/planner"
@@ -165,11 +166,29 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 		if err != nil {
 			return nil, err
 		}
+		lines := plan.ExplainCosts(p)
+		if q.CostsOff {
+			lines = plan.Explain(p)
+		}
 		r := &Result{Tag: "EXPLAIN", Columns: []Column{{"QUERY PLAN", tuple.Text}}}
-		for _, line := range plan.Explain(p) {
+		for _, line := range lines {
 			r.Rows = append(r.Rows, []tuple.Datum{line})
 		}
 		return r, nil
+	case *query.Analyze:
+		rels := []*catalog.RelationInfo{q.Rel}
+		if q.Rel == nil {
+			var err error
+			if rels, err = s.cat.Tables(); err != nil {
+				return nil, err
+			}
+		}
+		for _, rel := range rels {
+			if err := s.analyze(rel); err != nil {
+				return nil, err
+			}
+		}
+		return &Result{Tag: "ANALYZE"}, nil
 	}
 	p, err := planner.Plan(q)
 	if err != nil {
@@ -203,6 +222,43 @@ func (s *Session) run(q query.Stmt) (*Result, error) {
 		return &Result{Tag: "DELETE " + strconv.Itoa(n)}, nil
 	}
 	return nil, fmt.Errorf("session: unexpected statement %T", q)
+}
+
+// analyze counts a table's pages and live tuples and records them, and
+// the sizes of its indexes, in pg_class. Anything but a table is skipped,
+// as PostgreSQL does with a warning.
+// PostgreSQL: do_analyze_rel in analyze.c.
+func (s *Session) analyze(rel *catalog.RelationInfo) error {
+	if rel.Kind != catalog.RelKindTable {
+		return nil
+	}
+	h := heap.Open(s.pool, rel.OID, rel.Desc)
+	pages, err := h.NBlocks()
+	if err != nil {
+		return err
+	}
+	var tuples int64
+	sc := h.Scan()
+	for sc.Next() {
+		tuples++
+	}
+	sc.Close()
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	if err := s.cat.UpdateStats(rel.OID, int32(pages), tuples, s.xid); err != nil {
+		return err
+	}
+	for _, idx := range rel.Indexes {
+		n, err := s.store.NBlocks(idx.OID)
+		if err != nil {
+			return err
+		}
+		if err := s.cat.UpdateStats(idx.OID, int32(n), tuples, s.xid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ddlError words a catalog error as PostgreSQL does.

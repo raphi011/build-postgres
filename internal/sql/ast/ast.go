@@ -475,6 +475,9 @@ func (*Commit) String() string   { return "COMMIT" }
 func (*Rollback) String() string { return "ROLLBACK" }
 
 func (s *Explain) String() string {
+	if s.CostsOff {
+		return "EXPLAIN (COSTS OFF) " + s.Stmt.String()
+	}
 	return "EXPLAIN " + s.Stmt.String()
 }
 
@@ -553,4 +556,9 @@ type Analyze struct {
 
 func (*Analyze) stmtNode() {}
 
-func (s *Analyze) String() string { panic("not implemented") }
+func (s *Analyze) String() string {
+	if s.Table == "" {
+		return "ANALYZE"
+	}
+	return "ANALYZE " + QuoteIdent(s.Table)
+}

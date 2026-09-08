@@ -113,7 +113,19 @@ func Analyze(stmt ast.Stmt, cat Catalog) (query.Stmt, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &query.Explain{Stmt: inner}, nil
+		return &query.Explain{Stmt: inner, CostsOff: s.CostsOff}, nil
+	case *ast.Analyze:
+		if s.Table == "" {
+			return &query.Analyze{}, nil
+		}
+		info, err := a.cat.Lookup(s.Table)
+		if errors.Is(err, catalog.ErrNotFound) {
+			return nil, errAt(noPos, ErrUndefinedTable, "relation %q does not exist", s.Table)
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &query.Analyze{Rel: info}, nil
 	}
 	return nil, fmt.Errorf("analyzer: unsupported statement %T", stmt)
 }
