@@ -348,6 +348,124 @@ func TestDiscard(t *testing.T) {
 	pool.Unpin(o2)
 }
 
+func TestDiscardKeepsPinsOfLiveReaders(t *testing.T) {
+	pool, _ := setup(t, 2, 1)
+	b, err := pool.Pin(rel, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pool.Discard(rel)
+
+	// The pin still stands: the reader may finish and Unpin without
+	// panicking, and the frame must not be handed to another relation
+	// while it is still pinned.
+	if err := pool.Store().Create(rel + 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Store().Extend(rel+1, page.New(0)); err != nil {
+		t.Fatal(err)
+	}
+	o, err := pool.Pin(rel+1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o == b {
+		t.Fatal("Discard handed out a frame a reader still holds pinned")
+	}
+	pool.Unpin(o)
+	pool.Unpin(b)
+
+	// Released, it is free again.
+	if _, err := pool.Pin(rel, 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestFlushAllUnderConcurrentWrites checks that FlushAll takes each
+// frame's content lock before writing it. A commit flushes the whole
+// pool while other sessions are still modifying pages, so unlike an
+// eviction it can meet a pinned frame with a writer in it. The race
+// detector is what decides this test.
+func TestFlushAllUnderConcurrentWrites(t *testing.T) {
+	const nblocks, nframes, workers, ops = 8, 6, 4, 200
+	pool, store := setup(t, nframes, nblocks)
+
+	// Each page carries a counter in item 2, as in TestConcurrentPins.
+	for blk := tuple.BlockNumber(0); blk < nblocks; blk++ {
+		b, err := pool.Pin(rel, blk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.Page().AddItem(make([]byte, 8))
+		b.MarkDirty()
+		pool.Unpin(b)
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(seed int64) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(seed))
+			for i := 0; i < ops; i++ {
+				b, err := pool.Pin(rel, tuple.BlockNumber(rng.Intn(nblocks)))
+				if errors.Is(err, ErrNoUnpinnedBuffers) {
+					i--
+					continue
+				}
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				b.Lock()
+				item, _ := b.Page().GetItem(2)
+				binary.LittleEndian.PutUint64(item, binary.LittleEndian.Uint64(item)+1)
+				b.MarkDirty()
+				b.Unlock()
+				pool.Unpin(b)
+			}
+		}(int64(w))
+	}
+
+	stop, flushed := make(chan struct{}), make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				flushed <- nil
+				return
+			default:
+			}
+			if err := pool.FlushAll(); err != nil {
+				flushed <- err
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	close(stop)
+	if err := <-flushed; err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.FlushAll(); err != nil {
+		t.Fatal(err)
+	}
+
+	var total uint64
+	for blk := tuple.BlockNumber(0); blk < nblocks; blk++ {
+		p := diskPage(t, store, blk)
+		item, err := p.GetItem(2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += binary.LittleEndian.Uint64(item)
+	}
+	if total != workers*ops {
+		t.Fatalf("total increments on disk = %d, want %d", total, workers*ops)
+	}
+}
+
 func TestConcurrentPins(t *testing.T) {
 	const nblocks, nframes, workers, ops = 16, 4, 8, 300
 	pool, store := setup(t, nframes, nblocks)

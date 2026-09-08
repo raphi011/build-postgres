@@ -190,7 +190,9 @@ row.
 
 A dirty frame is written when it is evicted, when `Flush` is called on it,
 or when `FlushAll` runs. Writing clears the dirty flag. A clean frame is
-never written. Nothing here calls `Sync`; ordering writes against the
+never written. An eviction never races a writer, because the frame it
+picks is unpinned; `FlushAll` can, so it holds the frame's content lock
+shared while it writes. Nothing here calls `Sync`; ordering writes against the
 write-ahead log is v2's concern, which is why the page LSN exists.
 
 ## API
@@ -227,9 +229,11 @@ Semantics the tests depend on:
   `ReadBuffer(rel, P_NEW)` in PostgreSQL.
 - `Unpin` on a buffer with a zero pin count is a programming error and
   panics.
-- `Discard` drops every frame belonging to a relation without writing,
-  pinned or not. It exists for `DROP TABLE` (chapter 08); callers must not
-  hold pins on that relation.
+- `Discard` drops every frame belonging to a relation from the lookup
+  table without writing, so no later `Pin` finds it. It exists for `DROP
+  TABLE` (chapter 08), which another session may be scanning through: a
+  frame that session still holds pinned keeps its pins, and becomes
+  reusable only when the last one is released.
 - `Stats` counts hits and misses in `Pin`, evictions of any frame that held
   a page, and every page write from any cause.
 
@@ -275,10 +279,12 @@ never replaced; `Page` returns it as is, which is why the slice aliases
 **victim.** The clock sweep section has the algorithm; what it does not
 say: step 1 is `nused < NFrames`, take `frames[nused]` and increment. In
 step 2 advance the hand *before* inspecting the frame, so it always ends
-past the victim. A frame with `valid == false` (after `Discard` or a
-failed load) is taken at once. A frame with pins resets nothing and bumps
-a `pinned` counter; any unpinned frame resets that counter to zero, and
-reaching `NFrames` returns `ErrNoUnpinnedBuffers`. The victim is
+past the victim. A frame with pins resets nothing and bumps a `pinned`
+counter; any unpinned frame resets that counter to zero, and reaching
+`NFrames` returns `ErrNoUnpinnedBuffers`. An unpinned frame with `valid
+== false` (after `Discard` or a failed load) is taken at once; the pin
+check has to come first, or `Discard` hands a frame to a new relation
+while its old reader is still reading it. The victim is
 `flush`ed, deleted from the table, marked invalid, and `Evictions++`; free
 frames from step 1 are not evictions (`TestClockSweepFreeFramesFirst`).
 PostgreSQL: `StrategyGetBuffer` in `freelist.c`.
@@ -292,10 +298,16 @@ cached and the next `Pin` is a hit (`TestPinHitAndMiss`).
 
 **Flush and FlushAll.** `flush(b)` returns at once when clean; otherwise
 `store.Write`, `Writes++`, clear the flag. `Flush` is the mutex plus
-`flush`. `FlushAll` walks `frames`, skips invalid ones, and returns the
-first error. Writes happen under the pool mutex without the content lock;
-that is safe because eviction only picks unpinned frames and every writer
-holds a pin (`TestConcurrentPins`).
+`flush`. An eviction writes under the pool mutex alone, which is safe
+because `victim` only picks unpinned frames and every writer holds a pin
+(`TestConcurrentPins`). `FlushAll` has no such guarantee — chapter 16
+calls it on every commit, while other sessions are in the middle of their
+pages — so it walks `frames` one at a time: under the mutex, skip a frame
+that is invalid or clean, else pin it; drop the mutex; take the content
+lock shared; retake the mutex, `flush`, unpin; release both. The pin is
+what keeps the frame from being evicted and refilled while the mutex is
+down, and the order is content lock before mutex, the order `MarkDirty`
+already imposes. Return the first write error.
 
 **Extend.** `victim()` first, then `clear` the frame and pass it to
 `store.Extend`, which returns the new block number for the tag. A store
@@ -304,9 +316,12 @@ a hit nor a miss. `TestExtend` checks `IsNew` on the returned page, the
 disk block count, and that the next `Pin` of that block is a hit.
 
 **Discard.** Walk `frames`; for each valid one whose tag names `rel`,
-delete the table entry and reset `valid`, `pins`, and `dirty`. Nothing is
-written. The sweep takes invalid frames first, so the freed frames are
-reused before any eviction.
+delete the table entry and reset `valid` and `dirty`. Nothing is written,
+and `pins` is left alone: another session may be halfway through a scan
+of the relation being dropped, and zeroing its pin makes its next `Unpin`
+panic and its frame reusable underneath it. The sweep takes unpinned
+invalid frames first, so the freed frames are reused before any
+eviction.
 
 ## Suggested order
 
@@ -330,10 +345,12 @@ Every test not named in that step or an earlier one still panics.
 2. Write-back. `Flush`, `FlushAll`. Green: `TestConcurrentPins`, which
    runs many goroutines that pin, lock, modify, unpin random pages through
    a pool far smaller than the working set, then flushes and checks that
-   every increment survived. It is the reason for `-race`.
+   every increment survived; and
+   `TestFlushAllUnderConcurrentWrites`, which flushes in a loop *while*
+   they run. They are the reason for `-race`.
 
    ```sh
-   go test -race ./internal/bufmgr/... -run 'TestConcurrentPins'
+   go test -race ./internal/bufmgr/... -run 'TestConcurrentPins|TestFlushAllUnderConcurrentWrites'
    ```
 3. Extend. `Extend`. Green: `TestExtend`; see Implementation notes for
    what it checks.
@@ -342,7 +359,8 @@ Every test not named in that step or an earlier one still panics.
    go test -race ./internal/bufmgr/... -run 'TestExtend'
    ```
 4. Discard. `Discard`. Green: `TestFlush` (it ends by discarding and checks
-   that no write happened), `TestDiscard`.
+   that no write happened), `TestDiscard`,
+   `TestDiscardKeepsPinsOfLiveReaders`.
 
    ```sh
    go test -race ./internal/bufmgr/... -run 'TestFlush|TestDiscard'
@@ -391,8 +409,11 @@ Every test not named in that step or an earlier one still panics.
   for `DROP TABLE` and wrong for anything else.
 - `TestDiscard` — a frame freed by `Discard` is skipped by the sweep and
   an eviction happens instead. Clearing `valid` is what marks the frame
-  as free, and `victim` must take an invalid frame the moment the hand
-  reaches it, before looking at pins or usage.
+  as free, and `victim` must take an unpinned invalid frame the moment
+  the hand reaches it, before looking at usage.
+- `TestDiscardKeepsPinsOfLiveReaders` — the discarded frame is handed
+  straight to another relation, or the reader's `Unpin` panics. `Discard`
+  leaves `pins` as it found it and `victim` checks pins before `valid`.
 - `TestConcurrentPins` — a deadlock, usually on the first eviction. The
   pool mutex is not reentrant, so a public method that holds it must call
   the private `victim`, `install` and `flush` helpers and never another

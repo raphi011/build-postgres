@@ -113,14 +113,19 @@ func (p *Pool) Flush(b *Buffer) error {
 }
 
 // FlushAll writes every dirty frame to disk, stopping at the first write
-// error.
+// error. Unlike an eviction it can meet a frame another goroutine is
+// writing to, so it pins each one and takes its content lock shared for
+// the write.
 // PostgreSQL: BufferSync in bufmgr.c.
 func (p *Pool) FlushAll() error {
 	panic("not implemented")
 }
 
-// Discard drops every frame of rel without writing, pinned or not; dirty
-// changes are lost. Other relations' frames are untouched.
+// Discard drops every frame of rel from the lookup table without writing;
+// dirty changes are lost, and no later Pin finds them. A frame another
+// goroutine still holds pinned keeps its pins, so that goroutine can
+// finish reading it and Unpin it; the frame is reused only once the last
+// pin is released. Other relations' frames are untouched.
 // PostgreSQL: DropRelationBuffers in bufmgr.c.
 func (p *Pool) Discard(rel tuple.OID) {
 	panic("not implemented")
@@ -133,3 +138,6 @@ func (p *Pool) Discard(rel tuple.OID) {
 func (p *Pool) Stats() Stats {
 	panic("not implemented")
 }
+
+// Store returns the data directory the pool reads and writes.
+func (p *Pool) Store() *smgr.DataDir { return p.store }
