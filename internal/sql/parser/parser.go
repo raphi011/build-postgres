@@ -219,7 +219,7 @@ func (p *parser) parseStmt() (ast.Stmt, error) {
 	case "delete":
 		return p.parseDelete()
 	case "begin":
-		return &ast.Begin{}, p.advance()
+		return p.parseBegin()
 	case "commit":
 		return &ast.Commit{}, p.advance()
 	case "rollback":
@@ -695,6 +695,43 @@ func (p *parser) parseDelete() (ast.Stmt, error) {
 
 // parseExplain parses EXPLAIN [(COSTS [ON | OFF])] stmt. The option
 // words are identifiers, not keywords, like type names (D19).
+// parseBegin parses BEGIN [ISOLATION LEVEL {READ COMMITTED | READ
+// UNCOMMITTED | REPEATABLE READ}].
+func (p *parser) parseBegin() (ast.Stmt, error) {
+	if err := p.expect("begin"); err != nil {
+		return nil, err
+	}
+	b := &ast.Begin{}
+	ok, err := p.accept("isolation")
+	if err != nil || !ok {
+		return b, err
+	}
+	if err := p.expect("level"); err != nil {
+		return nil, err
+	}
+	switch {
+	case p.isKeyword("read"):
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if !p.isKeyword("committed") && !p.isKeyword("uncommitted") {
+			return nil, p.syntaxError("COMMITTED or UNCOMMITTED")
+		}
+		b.Isolation = ast.ReadCommitted
+	case p.isKeyword("repeatable"):
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if !p.isKeyword("read") {
+			return nil, p.syntaxError("READ")
+		}
+		b.Isolation = ast.RepeatableRead
+	default:
+		return nil, p.syntaxError("READ or REPEATABLE")
+	}
+	return b, p.advance()
+}
+
 func (p *parser) parseExplain() (ast.Stmt, error) {
 	if err := p.expect("explain"); err != nil {
 		return nil, err

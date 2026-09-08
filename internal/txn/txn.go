@@ -9,9 +9,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/raphi011/build-postgres/internal/catalog"
+	"github.com/raphi011/build-postgres/internal/smgr"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
 
@@ -68,8 +70,9 @@ type Manager struct {
 
 	mu       sync.Mutex
 	next     tuple.XID
-	running  map[tuple.XID]bool
+	running  map[tuple.XID]chan struct{} // closed when the transaction finishes
 	segments map[uint32]*os.File
+	waiting  int // goroutines blocked in Wait
 }
 
 // Transaction is one transaction between Begin and Commit or Abort.
@@ -91,10 +94,13 @@ func Open(dir string) (*Manager, error) {
 	if err := os.MkdirAll(filepath.Join(dir, Dir), 0o755); err != nil {
 		return nil, err
 	}
+	if err := smgr.SyncDir(dir); err != nil {
+		return nil, err
+	}
 	return &Manager{
 		dir:      dir,
 		next:     ctl.NextXID,
-		running:  map[tuple.XID]bool{},
+		running:  map[tuple.XID]chan struct{}{},
 		segments: map[uint32]*os.File{},
 	}, nil
 }
@@ -105,7 +111,10 @@ func Open(dir string) (*Manager, error) {
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	clear(m.running)
+	for xid, done := range m.running {
+		close(done)
+		delete(m.running, xid)
+	}
 	var first error
 	for seg, f := range m.segments {
 		if err := f.Close(); err != nil && first == nil {
@@ -138,7 +147,7 @@ func (m *Manager) Begin() (*Transaction, error) {
 		return nil, err
 	}
 	m.next = xid + 1
-	m.running[xid] = true
+	m.running[xid] = make(chan struct{})
 	return &Transaction{XID: xid, m: m}, nil
 }
 
@@ -167,13 +176,15 @@ func (t *Transaction) finish(status Status, sync bool) error {
 	m := t.m
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.running[t.XID] {
+	done, ok := m.running[t.XID]
+	if !ok {
 		return ErrFinished
 	}
 	if err := m.set(t.XID, status, sync); err != nil {
 		return err
 	}
 	delete(m.running, t.XID)
+	close(done)
 	return nil
 }
 
@@ -196,7 +207,7 @@ func (m *Manager) Status(xid tuple.XID) (Status, error) {
 	if xid >= m.next {
 		return 0, ErrFutureXID
 	}
-	if m.running[xid] {
+	if _, ok := m.running[xid]; ok {
 		return InProgress, nil
 	}
 	b, err := m.get(xid)
@@ -217,7 +228,19 @@ func (m *Manager) segment(xid tuple.XID) (*os.File, error) {
 		return f, nil
 	}
 	name := filepath.Join(m.dir, Dir, fmt.Sprintf("%04X", seg))
-	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(name, os.O_RDWR, 0o644)
+	if errors.Is(err, os.ErrNotExist) {
+		// A new segment: the file's name has to reach the disk too, or
+		// a crash after the first commit loses the whole log and every
+		// transaction in it reads back as aborted.
+		f, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0o644)
+		if err == nil {
+			if serr := smgr.SyncDir(filepath.Join(m.dir, Dir)); serr != nil {
+				f.Close()
+				return nil, serr
+			}
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -279,14 +302,35 @@ func (m *Manager) set(xid tuple.XID, s Status, sync bool) error {
 // they agree with each other.
 // PostgreSQL: GetSnapshotData in procarray.c.
 func (m *Manager) Snapshot() (xmin, xmax tuple.XID, xip []tuple.XID) {
-	panic("not implemented")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	xmin, xmax = m.next, m.next
+	for xid := range m.running {
+		xip = append(xip, xid)
+		if xid < xmin {
+			xmin = xid
+		}
+	}
+	slices.Sort(xip)
+	return xmin, xmax, xip
 }
 
 // Wait blocks until the transaction xid has committed or aborted, or the
 // manager is closed. It returns at once for an ID that is not running.
 // PostgreSQL: XactLockTableWait in lmgr.c.
 func (m *Manager) Wait(xid tuple.XID) {
-	panic("not implemented")
+	m.mu.Lock()
+	done, ok := m.running[xid]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	m.waiting++
+	m.mu.Unlock()
+	<-done
+	m.mu.Lock()
+	m.waiting--
+	m.mu.Unlock()
 }
 
 // Waiting returns the number of goroutines blocked in Wait. The
@@ -294,5 +338,7 @@ func (m *Manager) Wait(xid tuple.XID) {
 // session from one that is still running.
 // PostgreSQL: pg_isolation_test_session_is_blocked in regress.c.
 func (m *Manager) Waiting() int {
-	panic("not implemented")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.waiting
 }

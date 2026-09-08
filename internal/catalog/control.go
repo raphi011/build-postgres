@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"github.com/raphi011/build-postgres/internal/smgr"
 	"github.com/raphi011/build-postgres/internal/tuple"
 )
 
@@ -79,7 +80,11 @@ func WriteControl(dir string, c Control) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// The rename is only durable once the directory entry is.
+	return smgr.SyncDir(filepath.Dir(path))
 }
 
 // controlMu serialises read-modify-write cycles of the control file: the
