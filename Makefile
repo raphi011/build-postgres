@@ -3,8 +3,9 @@
 GO ?= go
 
 CH01 = ./internal/page/...
+CH02 = $(CH01) ./internal/tuple/... ./cmd/pgdb/...
 
-.PHONY: build test vet regress test-ch01
+.PHONY: build test vet regress test-ch01 test-ch02
 
 build:
 	$(GO) build ./...
@@ -21,3 +22,5 @@ regress:
 
 test-ch01:
 	$(GO) test -race $(CH01)
+test-ch02:
+	$(GO) test -race $(CH02)
