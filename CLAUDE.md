@@ -1,8 +1,8 @@
 # CLAUDE.md
 
 Book-style repo: "Build Your Own PostgreSQL" in Go, one chapter per subsystem.
-`docs/PLAN.md` is the chapter plan; `docs/DECISIONS.md` (D1…Dn) records the
-design choices. Read the relevant decision before changing any design.
+`docs/DECISIONS.md` (D1…Dn) records the design choices. Read the relevant
+decision before changing any design.
 
 ## Two branches, one contract
 
@@ -20,7 +20,8 @@ design choices. Read the relevant decision before changing any design.
 ```sh
 git checkout main
 # write chapters/NN-name/README.md, internal/<pkg>/<pkg>.go (skeleton),
-# internal/<pkg>/<pkg>_test.go; add CHNN to the Makefile; update README "Status"
+# internal/<pkg>/<pkg>_test.go; add CHNN to the Makefile; strike the chapter
+# from README "What comes after v1"
 gofmt -l . ; go vet ./...
 git add -A && git commit -m "Add chapter NN: <name> (skeleton and tests)"
 
@@ -59,16 +60,20 @@ git checkout main
   Short/Medium/Long rating, an hour estimate and the hard step), the
   chapter-00 architecture map with this chapter's box in brackets,
   motivation, PostgreSQL source paths, the design, exact on-disk layout or
-  algorithm where tests depend on it, API listing, "Semantics the tests
-  depend on" bullets, "Implementation notes" (`**Go you will need.**` line,
-  then an algorithm sketch per non-trivial function or private design area,
-  no code; from ch06 every sketch is folded into `<details>`, from ch12 one
-  named area per chapter is left unsketched), "Suggested order" (numbered
+  algorithm where tests depend on it, a worked example on concrete data in
+  every section that pins one and a `**Predict.**` line on the hardest
+  (D27), API listing, "Semantics the tests depend on" bullets,
+  "Implementation notes" (`**Go you will need.**` line, then an algorithm
+  sketch per non-trivial function or private design area, no code; from
+  ch06 every sketch is folded into `<details>`, from ch12 one named area
+  per chapter is left unsketched (D26)), "Suggested order" (numbered
   steps: functions to implement, then the tests that go green; every stub
-  and every test named exactly once), "Why not <alternative>" with its
-  D-number, "Out of scope", "Check your understanding" (five questions,
-  answers in <details>), "Challenges" (two or three, the last a reading
-  challenge). Renaming or adding a test means updating that list.
+  and every test named exactly once, each step followed by its exact
+  `go test -race ... -run` line, closed by a "When a test fails" block
+  keyed by symptom), "Why not <alternative>" with its D-number, "Out of
+  scope", "Check your understanding" (five questions, answers in
+  <details>), "Challenges" (two or three, the last a reading challenge)
+  (D28). Renaming or adding a test means updating that list.
 - Skeleton doc comments state the error contract ("Returns ErrX if ...")
   and, where a genuine counterpart exists, end with
   `// PostgreSQL: FuncName in file.c.`

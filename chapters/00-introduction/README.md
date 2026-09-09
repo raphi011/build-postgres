@@ -51,7 +51,6 @@ chapters/NN-name/README.md   the text for each chapter
 internal/<pkg>/              one or two packages per chapter, with tests
 cmd/pgdb/                    the binary; a REPL from chapter 11
 testdata/regress/            SQL regression tests, from chapter 11
-docs/PLAN.md                 the full chapter plan
 docs/DECISIONS.md            why things are the way they are
 ```
 
