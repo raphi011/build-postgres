@@ -25,6 +25,9 @@ you can read the real thing alongside your own.
 - Later chapters build on your earlier code. Nothing is thrown away.
 - The `solution` branch has a reference implementation, one commit per chapter,
   so `git diff ch05 ch06` shows exactly what a chapter adds.
+- `cmd/pgdb` is a REPL from chapter 11 and, from chapter 02, a page inspector:
+  `pgdb sample DIR` writes a small relation and `pgdb dump FILE [BLOCK]` prints
+  its page headers, line pointers and tuple headers.
 
 ```sh
 go test ./internal/page/...        # run one chapter's tests
@@ -32,34 +35,19 @@ make test-ch05                     # run everything up to chapter 5
 make regress                       # SQL regression suite (chapter 11+)
 ```
 
-## Roadmap
+Design decisions are in [docs/DECISIONS.md](docs/DECISIONS.md).
 
-See [docs/PLAN.md](docs/PLAN.md) for the full chapter-by-chapter plan and
-[docs/DECISIONS.md](docs/DECISIONS.md) for the design decisions behind it.
+## What comes after v1
 
-| Part | Chapters | You end up with |
-|---|---|---|
-| 1. Storage | 01–05 | Pages, tuples, files, buffer pool, heap scans that survive restart |
-| 2. SQL front end | 06–09 | Lexer, parser, system catalog, name/type resolution |
-| 3. Execution | 10–11 | Expression evaluation, iterator executor, a working REPL |
-| 4. Indexing | 12–13 | On-disk B-tree, `CREATE INDEX`, index scans, `PRIMARY KEY` |
-| 5. Planning | 14–15 | Cost-based scan choice, joins, `EXPLAIN` |
-| 6. Transactions | 16–17 | Transaction log, MVCC snapshots, isolated concurrent sessions |
+Version 2, in intended order:
 
-Version 2 (not yet planned in detail): VACUUM, write-ahead log and crash
-recovery, aggregates, the PostgreSQL wire protocol so real `psql` connects.
+1. VACUUM: reclaim dead tuples and index entries, `relfrozenxid`.
+2. Write-ahead log: records for heap and B-tree changes, page LSNs enforced
+   in the buffer manager, fsync on commit.
+3. Crash recovery and checkpoints: redo from the last checkpoint, tested by
+   discarding the buffer pool mid-transaction.
+4. Aggregates and `GROUP BY` (hash and sorted aggregation).
+5. PostgreSQL wire protocol v3 so real `psql` and drivers connect.
 
-## Status
-
-All planned chapters (00–17: storage, SQL front end, expression
-evaluation, executor, a working REPL with the SQL regression suite, the
-on-disk B-tree, `CREATE INDEX` with `PRIMARY KEY`, unique indexes, and
-an index scan node, `ANALYZE`, the cost model, and `EXPLAIN` with costs,
-nested loop and hash joins with a cost-based join order, transaction IDs
-with the commit log, `BEGIN`, `COMMIT`, and `ROLLBACK`, and MVCC
-snapshots with concurrent sessions, `READ COMMITTED` and `REPEATABLE
-READ`, and the isolation test suite) are written on `main` with a
-reference implementation on `solution`. `cmd/pgdb` is a REPL from
-chapter 11 and, from chapter 02, a page inspector: `pgdb sample DIR`
-writes a small relation and `pgdb dump FILE [BLOCK]` prints its page
-headers, line pointers and tuple headers.
+Not planned: TOAST, tablespaces, partitioning, parallel query, replication,
+JIT, the extension system, more than four data types.

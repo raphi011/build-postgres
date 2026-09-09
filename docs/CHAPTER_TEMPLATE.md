@@ -14,15 +14,15 @@ A chapter is three things, committed together on `main`:
   may differ from the solution.
 - `internal/<pkg>/<pkg>_test.go`: the full tests. They are the contract.
 
-Then `CHNN` in the Makefile, a "Status" line in the root README, and the
-chapter's line in `docs/PLAN.md` marked done.
+Then `CHNN` in the Makefile, and the chapter struck from "What comes after
+v1" in the root README.
 
 ## README skeleton
 
 ````markdown
 # Chapter NN: Name
 
-**Goal.** One or two sentences, from the `Goal:` line in docs/PLAN.md.
+**Goal.** One or two sentences: what the chapter builds.
 
 **You edit.** `internal/<pkg>/<file>.go`: N functions with
 `panic("not implemented")` bodies, `First` through `Last`. Nothing
@@ -157,7 +157,7 @@ describe, so do these on a branch and come back.
   on data small enough to check by hand and taken from a test where a
   test uses one. A layout gets a labelled dump (offset, bytes, field);
   an algorithm gets a table with one row per step and the state after
-  it. Prose, not Go `Example` tests (D2), so the reader can follow it
+  it. Prose, not Go `Example` tests (D27), so the reader can follow it
   before any code compiles.
 - Predict lines: one per chapter, a `**Predict.**` paragraph at the top
   of the hardest design section. One question, no answer; the section
@@ -169,7 +169,7 @@ describe, so do these on a branch and come back.
   to establish the pattern; later chapters show none. Chapters 01 to 05
   are fully worked in the open; from chapter 06 every entry but "Go you
   will need" is folded into `<details>`; from chapter 12 one named area
-  per chapter is left unsketched.
+  per chapter is left unsketched (D26).
 - Suggested order: three to eight steps. Every stubbed function and
   every `TestX`/`FuzzX` in the chapter's packages appears exactly once. A
   test goes in the earliest step at which every function it calls
@@ -188,11 +188,11 @@ describe, so do these on a branch and come back.
   Sourced from the traps in Implementation notes and from what the
   solution got wrong first. Ungated: no `<details>`.
 - Check your understanding: five questions after Out of scope, each
-  answer in `<details><summary>Answer</summary>`. Order: two concrete
-  ones the reader computes from the chapter's numbers, two on why the
-  design is what it is, one on PostgreSQL's real trade-off. Blank line
-  after the `<summary>` line and before `</details>`, or the Markdown
-  inside does not render.
+  answer in `<details><summary>Answer</summary>` (D28). Order: two
+  concrete ones the reader computes from the chapter's numbers, two on
+  why the design is what it is, one on PostgreSQL's real trade-off.
+  Blank line after the `<summary>` line and before `</details>`, or the
+  Markdown inside does not render.
 - Length: wrap at 76 columns. Table rows and the `-run` lines are
   exempt; they cannot be wrapped. Terse; no filler, no "simply".
 

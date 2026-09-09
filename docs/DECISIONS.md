@@ -312,3 +312,34 @@ Rejected: stamping the old version's xmax before the insert, as chapters
 5 to 16 did before this. It serialises two updaters on the old tuple,
 which is why it looked right, but a failed insert then leaves a row
 deleted with no replacement and no way to put it back.
+
+## D26: Implementation sketches fade from chapter 06
+
+Chapters 01 to 05 print every function sketch in the open. From chapter 06
+each entry but "Go you will need" is folded into `<details>`, and from chapter
+12 one named area per chapter is left unsketched, introduced by a `**Yours to
+design.**` paragraph that names it and the constraints the tests pin. The
+alternative, keeping every sketch open and relying on the questions and
+challenges to force generation, leaves a reader who follows the notes having
+designed nothing; deleting the sketches instead of folding them strands a
+reader who is stuck. Folding keeps the ladder from sketch to debugging to
+design while the answer stays one click away.
+
+## D27: Worked examples are prose, not Go `Example` tests
+
+Every design section that pins a layout or an algorithm ends with a worked
+example on concrete data: a labelled dump for a layout, a table with one row
+per step for an algorithm. Go `Example` tests with `// Output:` blocks are
+checkable and show up in godoc, but on `main` they panic like every other
+test, they add names to the Suggested order list, and they cannot be read
+until the package compiles. A prose example is readable on the first pass,
+which is when the reader needs it.
+
+## D28: Questions and challenges live in the chapter README
+
+"Check your understanding" (five questions, answers in `<details>`) and
+"Challenges" (two or three, the last a reading challenge) are sections of the
+chapter README, not a separate exercises file and not an appendix of answers.
+The reader who has just finished Out of scope is the one the questions are
+for, and a second file would drift from the chapter it tests. Answers are
+folded so the page still reads as one document.
