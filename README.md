@@ -37,6 +37,9 @@ make regress                       # SQL regression suite (chapter 11+)
 
 Design decisions are in [docs/DECISIONS.md](docs/DECISIONS.md).
 
+For a continuous explanation of the concepts across all chapters, read the
+[prose guide](docs/CONCEPTUAL_GUIDE.md).
+
 ## What comes after v1
 
 Version 2, in intended order:
